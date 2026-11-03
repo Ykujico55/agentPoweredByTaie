@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "upstream": "https://github.com/pascal-lab/Tai-e.git",
+  "tag": "v0.5.4",
+  "commit": "6474e7da62fb1f3b692331040e66692cbf4d630d",
+  "version": "0.5.4",
+  "directory": "vendor/Tai-e"
+}

@@ -1,0 +1,6 @@
+{
+  "sourceRoots": ["src/main/java"],
+  "classpath": [],
+  "analyses": ["dropped-exception", "clone-idiom", "dead-code"],
+  "timeoutMs": 120000
+}

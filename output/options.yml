@@ -1,0 +1,23 @@
+optionsFile: null
+printHelp: true
+classPath: []
+appClassPath: []
+mainClass: null
+inputClasses: []
+javaVersion: 21
+useCurrentJRE: true
+androidMode: false
+androidJars: android-benchmarks/android-platforms
+worldBuilderClass: pascal.taie.frontend.java.JavaWorldBuilder
+outputDir: output
+preBuildIR: false
+worldCacheMode: false
+scope: APP
+nativeModel: true
+planFile: null
+analyses: {}
+onlyGenPlan: false
+keepResult:
+- $KEEP-ALL
+jreDir: null
+ssa: false

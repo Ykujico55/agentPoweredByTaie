@@ -1,0 +1,64 @@
+import assert from 'node:assert/strict';
+import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { checkMavenInDocker } from '../src/docker-maven.ts';
+
+const runDir = path.resolve('.taie-agent', 'maven-smoke', new Date().toISOString().replaceAll(/[:.]/g, '-'));
+const projectDir = path.join(runDir, 'project');
+await mkdir(runDir, { recursive: true });
+await cp(path.resolve('tests/fixtures/maven-simple'), projectDir, { recursive: true });
+const results: Record<string, unknown> = {};
+const check = async (name: string, dependencyNetwork = false) => {
+  const report = await checkMavenInDocker({ projectDir, analyses: ['dropped-exception'], dependencyNetwork, timeoutMs: 600_000 });
+  results[name] = { status: report.status, reportPath: report.reportPath, durationMs: report.durationMs };
+  await writeFile(path.join(runDir, 'result.json'), JSON.stringify(results, null, 2));
+  console.log(`${name}: ${report.status}; ${report.reportPath}`);
+  return report;
+};
+const clean = await check('dependency-findings', true);
+assert.equal(clean.status, 'findings', clean.reportPath);
+assert.equal(clean.maven?.build, 'passed');
+assert.equal(clean.maven?.test.status, 'passed');
+assert.ok(clean.analysis?.findings.some(finding => finding.className?.startsWith('org.apache.commons.lang3.')));
+assert.ok(clean.analysis?.findings.every(finding => finding.className !== 'example.Greeter'));
+assert.equal(clean.maven?.test.tests, 1);
+assert.match(clean.maven!.versions.java!, /^17\./);
+assert.equal(clean.analysis?.evidence.compileCommand, undefined, 'Tai-e must use Maven classes, not recompile');
+assert.ok(clean.analysis?.evidence.compiledClasses);
+assert.equal(clean.checkNetwork, 'none');
+
+const testFile = path.join(projectDir, 'src/test/java/example/GreeterTest.java');
+const originalTest = await readFile(testFile, 'utf8');
+await writeFile(testFile, originalTest.replace('assertEquals(', 'assertEquals("intentional failure", '));
+// Change the expected output without changing production code.
+await writeFile(testFile, (await readFile(testFile, 'utf8')).replace('"Hello, Tai-e!"', '"wrong expected greeting"'));
+const failedTest = await check('failed-test');
+assert.equal(failedTest.status, 'test_failed', failedTest.reportPath);
+assert.equal(failedTest.maven?.build, 'passed');
+assert.ok(failedTest.maven!.test.failures > 0);
+await writeFile(testFile, originalTest);
+
+const sourceFile = path.join(projectDir, 'src/main/java/example/Greeter.java');
+const originalSource = await readFile(sourceFile, 'utf8');
+await writeFile(sourceFile, 'package example; public class Greeter { invalid Java }');
+const failedBuild = await check('failed-build');
+assert.equal(failedBuild.status, 'build_failed', failedBuild.reportPath);
+assert.equal(failedBuild.analysis, undefined);
+await writeFile(sourceFile, originalSource);
+await writeFile(sourceFile, originalSource.replace(/}\s*$/, `
+    public static void swallowed(String input) {
+        try { Integer.parseInt(input); } catch (NumberFormatException ignored) { }
+    }
+}
+`));
+const findings = await check('findings');
+assert.equal(findings.status, 'findings', findings.reportPath);
+assert.ok(findings.analysis?.findings.some(finding => finding.type === 'DE_MIGHT_IGNORE' && finding.className === 'example.Greeter'));
+// A separate JDK-only control exercises the zero-finding result. The dependency
+// warnings above stay in their original report; this is not a repair/suppression.
+await writeFile(sourceFile, originalSource.replace('import org.apache.commons.lang3.StringUtils;', '')
+  .replace('StringUtils.defaultIfBlank(name, "stranger")', '(name == null || name.isBlank() ? "stranger" : name)'));
+const passed = await check('passed');
+assert.equal(passed.status, 'passed', passed.reportPath);
+await writeFile(sourceFile, originalSource);
+console.log(`Maven smoke passed. Evidence: ${runDir}`);

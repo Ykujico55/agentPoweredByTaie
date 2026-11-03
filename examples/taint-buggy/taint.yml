@@ -1,0 +1,9 @@
+# Demonstration policy: values returned by source may not reach sink argument 0.
+# These methods model an input/trust boundary, not a claim that println is always unsafe.
+sources:
+  - kind: call
+    method: "<example.Main: java.lang.String source(java.lang.String)>"
+    index: result
+sinks:
+  - method: "<example.Main: void sink(java.lang.String)>"
+    index: 0

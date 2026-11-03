@@ -1,0 +1,9 @@
+**
+!package.json
+!package-lock.json
+!src/
+!src/**
+!java-adapter/
+!java-adapter/**
+!containers/
+!containers/**

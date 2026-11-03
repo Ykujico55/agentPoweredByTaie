@@ -1,0 +1,7 @@
+{
+  "analyses": ["taint"],
+  "mainClass": "example.Main",
+  "sourceRoots": ["src/main/java"],
+  "taintConfig": "taint.yml",
+  "taintImplicitEntries": false
+}

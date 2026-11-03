@@ -1,0 +1,12 @@
+node_modules/
+.tools/
+vendor/Tai-e/
+.taie-agent/
+.env
+.env.*
+!.env.example
+examples/**/.taie-agent/
+examples/**/target/
+examples/**/build/
+*.class
+*.log

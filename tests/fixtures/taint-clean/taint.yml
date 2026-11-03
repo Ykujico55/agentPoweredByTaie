@@ -1,0 +1,8 @@
+# Same configured policy as taint-buggy; the sink now receives only a constant.
+sources:
+  - kind: call
+    method: "<example.Main: java.lang.String source(java.lang.String)>"
+    index: result
+sinks:
+  - method: "<example.Main: void sink(java.lang.String)>"
+    index: 0

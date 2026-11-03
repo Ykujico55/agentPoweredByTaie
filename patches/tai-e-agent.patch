@@ -1,0 +1,834 @@
+diff --git a/src/main/java/pascal/taie/analysis/bugfinder/nullpointer/IsNullFact.java b/src/main/java/pascal/taie/analysis/bugfinder/nullpointer/IsNullFact.java
+index 28c0cbb..c1fc721 100644
+--- a/src/main/java/pascal/taie/analysis/bugfinder/nullpointer/IsNullFact.java
++++ b/src/main/java/pascal/taie/analysis/bugfinder/nullpointer/IsNullFact.java
+@@ -23,9 +23,10 @@
+ package pascal.taie.analysis.bugfinder.nullpointer;
+ 
+ import pascal.taie.analysis.dataflow.fact.MapFact;
++import pascal.taie.ir.exp.NullLiteral;
++import pascal.taie.ir.exp.ReferenceLiteral;
+ import pascal.taie.ir.exp.Var;
+-import pascal.taie.language.type.ArrayType;
+-import pascal.taie.language.type.ClassType;
++import pascal.taie.language.type.ReferenceType;
+ 
+ import java.util.Collections;
+ import java.util.Map;
+@@ -46,14 +47,23 @@ class IsNullFact extends MapFact<Var, IsNullValue> {
+ 
+     @Override
+     public IsNullValue get(Var var) {
++        // The bytecode frontend represents null as a temporary constant Var,
++        // which has no defining statement and may have NullType.
++        if (var.isConst()) {
++            if (var.getConstValue() instanceof NullLiteral) {
++                return IsNullValue.NULL;
++            } else if (var.getConstValue() instanceof ReferenceLiteral) {
++                return IsNullValue.NONNULL;
++            }
++        }
+         return map.getOrDefault(var, IsNullValue.UNDEF);
+     }
+ 
+     @Override
+     public boolean update(Var key, IsNullValue value) {
+-        if (key.getType() instanceof ClassType
+-                || key.getType() instanceof ArrayType) {
+-            return super.update(key, value);
++        if (key.getType() instanceof ReferenceType) {
++            // Temporary constants are immutable; their value comes from get().
++            return !key.isConst() && super.update(key, value);
+         }
+         throw new UnsupportedOperationException();
+     }
+diff --git a/src/main/resources/tai-e-analyses.yml b/src/main/resources/tai-e-analyses.yml
+index 7a65afc..8c7ce97 100644
+--- a/src/main/resources/tai-e-analyses.yml
++++ b/src/main/resources/tai-e-analyses.yml
+@@ -168,3 +168,8 @@
+ - description: find the method that may drop or ignore exceptions
+   analysisClass: pascal.taie.analysis.bugfinder.DroppedException
+   id: dropped-exception
++
++- description: find integral division or remainder by a definitely zero divisor
++  analysisClass: pascal.taie.analysis.bugfinder.DivisionByZero
++  id: division-by-zero
++  requires: [ cfg,const-prop,throw ]
+diff --git a/src/test/java/pascal/taie/analysis/bugfinder/BugFinderTestSuite.java b/src/test/java/pascal/taie/analysis/bugfinder/BugFinderTestSuite.java
+index 1741b8e..0efe1a5 100644
+--- a/src/test/java/pascal/taie/analysis/bugfinder/BugFinderTestSuite.java
++++ b/src/test/java/pascal/taie/analysis/bugfinder/BugFinderTestSuite.java
+@@ -32,6 +32,8 @@ import org.junit.platform.suite.api.Suite;
+         DroppedExceptionTest.class,
+         IsNullTest.class,
+         NullPointerDetectionTest.class,
++        NullLiteralBytecodeTest.class,
++        DivisionByZeroTest.class,
+ })
+ public class BugFinderTestSuite {
+ }
+diff --git a/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java b/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java
+new file mode 100644
+index 0000000..e0a3938
+--- /dev/null
++++ b/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java
+@@ -0,0 +1,375 @@
++/*
++ * Tai-e: A Static Analysis Framework for Java
++ *
++ * Copyright (C) 2022 Tian Tan <tiantan@nju.edu.cn>
++ * Copyright (C) 2022 Yue Li <yueli@nju.edu.cn>
++ *
++ * This file is part of Tai-e.
++ *
++ * Tai-e is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * Tai-e is distributed in the hope that it will be useful,but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General
++ * Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with Tai-e. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package pascal.taie.analysis.bugfinder;
++
++import pascal.taie.analysis.MethodAnalysis;
++import pascal.taie.analysis.dataflow.analysis.AbstractDataflowAnalysis;
++import pascal.taie.analysis.dataflow.analysis.constprop.CPFact;
++import pascal.taie.analysis.dataflow.analysis.constprop.ConstantPropagation;
++import pascal.taie.analysis.dataflow.analysis.constprop.Evaluator;
++import pascal.taie.analysis.dataflow.analysis.constprop.Value;
++import pascal.taie.analysis.dataflow.fact.MapFact;
++import pascal.taie.analysis.dataflow.fact.NodeResult;
++import pascal.taie.analysis.dataflow.solver.Solver;
++import pascal.taie.analysis.exception.ThrowAnalysis;
++import pascal.taie.analysis.exception.ThrowResult;
++import pascal.taie.analysis.graph.cfg.CFG;
++import pascal.taie.analysis.graph.cfg.CFGBuilder;
++import pascal.taie.analysis.graph.cfg.CFGEdge;
++import pascal.taie.config.AnalysisConfig;
++import pascal.taie.config.ConfigException;
++import pascal.taie.ir.IR;
++import pascal.taie.ir.exp.ArithmeticExp;
++import pascal.taie.ir.exp.CastExp;
++import pascal.taie.ir.exp.ComparisonExp;
++import pascal.taie.ir.exp.Exp;
++import pascal.taie.ir.exp.Exps;
++import pascal.taie.ir.exp.IntLiteral;
++import pascal.taie.ir.exp.LongLiteral;
++import pascal.taie.ir.exp.NegExp;
++import pascal.taie.ir.exp.Var;
++import pascal.taie.ir.stmt.DefinitionStmt;
++import pascal.taie.ir.stmt.If;
++import pascal.taie.ir.stmt.Stmt;
++import pascal.taie.ir.stmt.SwitchStmt;
++import pascal.taie.language.type.LongType;
++import pascal.taie.language.classes.ExceptionNames;
++import pascal.taie.util.collection.Sets;
++
++import java.util.ArrayDeque;
++import java.util.Collections;
++import java.util.Map;
++import java.util.Queue;
++import java.util.Set;
++
++/**
++ * Reports integral division/remainder whose divisor is definitely zero at the
++ * operation. Unknown divisors and floating-point operations are not reported.
++ * Integer facts come from constant propagation; a small companion analysis
++ * handles long values, which the existing int-only constant propagation omits.
++ * Requires throw and CFG options {@code exception:all} so that implicit
++ * ArithmeticException handlers are included in the control-flow graph.
++ */
++public class DivisionByZero extends MethodAnalysis<Set<BugInstance>> {
++
++    public static final String ID = "division-by-zero";
++
++    public DivisionByZero(AnalysisConfig config) {
++        super(config);
++    }
++
++    @Override
++    public Set<BugInstance> analyze(IR ir) {
++        CFG<Stmt> cfg = ir.getResult(CFGBuilder.ID);
++        requireImplicitExceptions(ir, cfg);
++        NodeResult<Stmt, CPFact> ints = ir.getResult(ConstantPropagation.ID);
++        NodeResult<Stmt, LongFact> longs = Solver.<Stmt, LongFact>getSolver()
++                .solve(new LongAnalysis(cfg, ints));
++        Set<BugInstance> findings = Sets.newOrderedSet();
++        Set<Stmt> visited = Sets.newSet();
++        Queue<Stmt> work = new ArrayDeque<>();
++        work.add(cfg.getEntry());
++        while (!work.isEmpty()) {
++            Stmt stmt = work.remove();
++            if (!visited.add(stmt)) {
++                continue;
++            }
++            boolean zero = hasZeroDivisor(stmt, ints, longs);
++            if (zero) {
++                ArithmeticExp arithmetic = (ArithmeticExp)
++                        ((DefinitionStmt<?, ?>) stmt).getRValue();
++                BugType type = arithmetic.getOperator() == ArithmeticExp.Op.DIV
++                        ? BugType.INTEGER_DIVIDE_BY_ZERO
++                        : BugType.INTEGER_REMAINDER_BY_ZERO;
++                findings.add(new BugInstance(type, Severity.CRITICAL, ir.getMethod())
++                        .setSourceLine(stmt.getLineNumber()));
++            }
++            for (CFGEdge<Stmt> edge : cfg.getOutEdgesOf(stmt)) {
++                if ((!zero || edge.isExceptional()) && isFeasible(edge, ints, longs)) {
++                    work.add(edge.target());
++                }
++            }
++        }
++        return findings;
++    }
++
++    private static void requireImplicitExceptions(IR ir, CFG<Stmt> cfg) {
++        ThrowResult exceptions = ir.getResult(ThrowAnalysis.ID);
++        for (Stmt stmt : ir) {
++            if (!(stmt instanceof DefinitionStmt<?, ?> definition)
++                    || !(definition.getRValue() instanceof ArithmeticExp arithmetic)
++                    || arithmetic.getOperator() != ArithmeticExp.Op.DIV
++                    && arithmetic.getOperator() != ArithmeticExp.Op.REM
++                    || !Exps.holdsInt(arithmetic.getOperand2())
++                    && !(arithmetic.getOperand2().getType() instanceof LongType)) {
++                continue;
++            }
++            boolean modeledThrow = exceptions != null && exceptions.mayThrowImplicitly(stmt).stream()
++                    .anyMatch(type -> type.getName().equals(ExceptionNames.ARITHMETIC_EXCEPTION));
++            boolean modeledEdge = cfg.getInEdgesOf(stmt).stream()
++                    .filter(edge -> !edge.isExceptional())
++                    .map(CFGEdge::source)
++                    .flatMap(predecessor -> cfg.getOutEdgesOf(predecessor).stream())
++                    .filter(CFGEdge::isExceptional)
++                    .flatMap(edge -> edge.getExceptions().stream())
++                    .anyMatch(type -> type.getName().equals(ExceptionNames.ARITHMETIC_EXCEPTION));
++            if (!modeledThrow || !modeledEdge) {
++                throw new ConfigException("division-by-zero requires implicit-exception modeling: "
++                        + "add -a throw=exception:all -a cfg=exception:all");
++            }
++        }
++    }
++
++    private static boolean hasZeroDivisor(Stmt stmt,
++                                         NodeResult<Stmt, CPFact> ints,
++                                         NodeResult<Stmt, LongFact> longs) {
++        if (!(stmt instanceof DefinitionStmt<?, ?> definition)
++                || !(definition.getRValue() instanceof ArithmeticExp arithmetic)
++                || arithmetic.getOperator() != ArithmeticExp.Op.DIV
++                && arithmetic.getOperator() != ArithmeticExp.Op.REM) {
++            return false;
++        }
++        Var divisor = arithmetic.getOperand2();
++        if (Exps.holdsInt(divisor)) {
++            Value value = ints.getInFact(stmt).get(divisor);
++            return value.isConstant() && value.getConstant() == 0;
++        } else if (divisor.getType() instanceof LongType) {
++            LongValue value = longs.getInFact(stmt).get(divisor);
++            return value.isConstant() && value.constant == 0L;
++        }
++        return false;
++    }
++
++    private static boolean isFeasible(CFGEdge<Stmt> edge,
++                                      NodeResult<Stmt, CPFact> ints,
++                                      NodeResult<Stmt, LongFact> longs) {
++        if (edge.source() instanceof If branch) {
++            Value condition = Evaluator.evaluate(branch.getCondition(), ints.getInFact(branch));
++            if (!condition.isConstant()) {
++                LongValue left = integralValue(branch.getCondition().getOperand1(),
++                        longs.getInFact(branch), ints.getInFact(branch));
++                LongValue right = integralValue(branch.getCondition().getOperand2(),
++                        longs.getInFact(branch), ints.getInFact(branch));
++                if (left.isConstant() && right.isConstant()) {
++                    boolean holds = switch (branch.getCondition().getOperator()) {
++                        case EQ -> left.constant.longValue() == right.constant.longValue();
++                        case NE -> left.constant.longValue() != right.constant.longValue();
++                        case LT -> left.constant < right.constant;
++                        case LE -> left.constant <= right.constant;
++                        case GT -> left.constant > right.constant;
++                        case GE -> left.constant >= right.constant;
++                    };
++                    condition = Value.makeConstant(holds ? 1 : 0);
++                }
++            }
++            if (condition.isConstant()) {
++                return !(condition.getConstant() == 0 && edge.getKind() == CFGEdge.Kind.IF_TRUE
++                        || condition.getConstant() != 0 && edge.getKind() == CFGEdge.Kind.IF_FALSE);
++            }
++        } else if (edge.source() instanceof SwitchStmt branch) {
++            Value value = ints.getInFact(branch).get(branch.getVar());
++            if (value.isConstant()) {
++                if (edge.isSwitchCase()) {
++                    return value.getConstant() == edge.getCaseValue();
++                } else if (edge.getKind() == CFGEdge.Kind.SWITCH_DEFAULT) {
++                    return !branch.getCaseValues().contains(value.getConstant());
++                }
++            }
++        }
++        return true;
++    }
++
++    private static LongValue integralValue(Var var, LongFact longs, CPFact ints) {
++        if (var.getType() instanceof LongType) {
++            return longs.get(var);
++        } else if (Exps.holdsInt(var)) {
++            Value value = ints.get(var);
++            if (value.isConstant()) {
++                return LongValue.of(value.getConstant());
++            }
++            // A long comparison yields an int, which int-only CP cannot evaluate.
++            LongValue comparison = longs.get(var);
++            if (comparison.isConstant()) {
++                return comparison;
++            }
++            return value.isUndef() && comparison.undefined ? LongValue.UNDEF : LongValue.NAC;
++        }
++        return LongValue.NAC;
++    }
++
++    private enum BugType implements pascal.taie.analysis.bugfinder.BugType {
++        INTEGER_DIVIDE_BY_ZERO,
++        INTEGER_REMAINDER_BY_ZERO
++    }
++
++    private record LongValue(boolean undefined, Long constant) {
++
++        private static final LongValue UNDEF = new LongValue(true, null);
++
++        private static final LongValue NAC = new LongValue(false, null);
++
++        private static LongValue of(long value) {
++            return new LongValue(false, value);
++        }
++
++        private boolean isConstant() {
++            return constant != null;
++        }
++
++        private static LongValue meet(LongValue a, LongValue b) {
++            if (a.undefined) {
++                return b;
++            } else if (b.undefined || a.equals(b)) {
++                return a;
++            }
++            return NAC;
++        }
++    }
++
++    private static class LongFact extends MapFact<Var, LongValue> {
++
++        private LongFact() {
++            this(Collections.emptyMap());
++        }
++
++        private LongFact(Map<Var, LongValue> map) {
++            super(map);
++        }
++
++        @Override
++        public LongValue get(Var var) {
++            if (var.isConst() && var.getConstValue() instanceof LongLiteral literal) {
++                return LongValue.of(literal.getValue());
++            }
++            return map.getOrDefault(var, LongValue.UNDEF);
++        }
++
++        @Override
++        public boolean update(Var var, LongValue value) {
++            if (var.isConst()) {
++                return false;
++            }
++            return value.undefined ? remove(var) != null : super.update(var, value);
++        }
++
++        @Override
++        public LongFact copy() {
++            return new LongFact(map);
++        }
++    }
++
++    private static class LongAnalysis extends AbstractDataflowAnalysis<Stmt, LongFact> {
++
++        private final NodeResult<Stmt, CPFact> ints;
++
++        private LongAnalysis(CFG<Stmt> cfg, NodeResult<Stmt, CPFact> ints) {
++            super(cfg);
++            this.ints = ints;
++        }
++
++        @Override
++        public boolean isForward() {
++            return true;
++        }
++
++        @Override
++        public LongFact newBoundaryFact() {
++            LongFact fact = newInitialFact();
++            cfg.getIR().getParams().stream()
++                    .filter(var -> var.getType() instanceof LongType)
++                    .forEach(var -> fact.update(var, LongValue.NAC));
++            return fact;
++        }
++
++        @Override
++        public LongFact newInitialFact() {
++            return new LongFact();
++        }
++
++        @Override
++        public void meetInto(LongFact fact, LongFact target) {
++            fact.forEach((var, value) -> target.update(var, LongValue.meet(value, target.get(var))));
++        }
++
++        @Override
++        public boolean transferNode(Stmt stmt, LongFact in, LongFact out) {
++            if (stmt instanceof DefinitionStmt<?, ?> definition
++                    && definition.getLValue() instanceof Var lhs
++                    && (lhs.getType() instanceof LongType
++                    || Exps.holdsInt(lhs))) {
++                boolean changed = false;
++                for (Var var : in.keySet()) {
++                    if (!var.equals(lhs)) {
++                        changed |= out.update(var, in.get(var));
++                    }
++                }
++                LongValue value = lhs.getType() instanceof LongType
++                        || definition.getRValue() instanceof ComparisonExp
++                        ? evaluate(definition.getRValue(), in, ints.getInFact(stmt)) : LongValue.NAC;
++                return out.update(lhs, value) || changed;
++            }
++            return out.copyFrom(in);
++        }
++
++        private LongValue evaluate(Exp exp, LongFact in, CPFact intFact) {
++            if (exp instanceof LongLiteral literal) {
++                return LongValue.of(literal.getValue());
++            } else if (exp instanceof IntLiteral literal) {
++                return LongValue.of(literal.getValue());
++            } else if (exp instanceof Var var) {
++                return integralValue(var, in, intFact);
++            } else if (exp instanceof CastExp cast && cast.getType() instanceof LongType) {
++                return evaluate(cast.getValue(), in, intFact);
++            } else if (exp instanceof NegExp negation) {
++                LongValue value = evaluate(negation.getOperand(), in, intFact);
++                return value.isConstant() ? LongValue.of(-value.constant) : value;
++            } else if (exp instanceof ComparisonExp comparison
++                    && comparison.getOperand1().getType() instanceof LongType) {
++                LongValue left = evaluate(comparison.getOperand1(), in, intFact);
++                LongValue right = evaluate(comparison.getOperand2(), in, intFact);
++                if (left.isConstant() && right.isConstant()) {
++                    return LongValue.of(Long.compare(left.constant, right.constant));
++                }
++                return left.equals(LongValue.NAC) || right.equals(LongValue.NAC)
++                        ? LongValue.NAC : LongValue.UNDEF;
++            } else if (exp instanceof ArithmeticExp arithmetic) {
++                LongValue a = evaluate(arithmetic.getOperand1(), in, intFact);
++                LongValue b = evaluate(arithmetic.getOperand2(), in, intFact);
++                if (a.isConstant() && b.isConstant()) {
++                    long left = a.constant;
++                    long right = b.constant;
++                    return switch (arithmetic.getOperator()) {
++                        case ADD -> LongValue.of(left + right);
++                        case SUB -> LongValue.of(left - right);
++                        case MUL -> LongValue.of(left * right);
++                        case DIV -> right == 0 ? LongValue.UNDEF : LongValue.of(left / right);
++                        case REM -> right == 0 ? LongValue.UNDEF : LongValue.of(left % right);
++                    };
++                }
++                return a.equals(LongValue.NAC) || b.equals(LongValue.NAC)
++                        ? LongValue.NAC : LongValue.UNDEF;
++            }
++            return LongValue.NAC;
++        }
++    }
++}
+diff --git a/src/test/java/pascal/taie/analysis/bugfinder/BytecodeBugFinderTests.java b/src/test/java/pascal/taie/analysis/bugfinder/BytecodeBugFinderTests.java
+new file mode 100644
+index 0000000..0a8e97a
+--- /dev/null
++++ b/src/test/java/pascal/taie/analysis/bugfinder/BytecodeBugFinderTests.java
+@@ -0,0 +1,68 @@
++/*
++ * Tai-e: A Static Analysis Framework for Java
++ *
++ * Copyright (C) 2022 Tian Tan <tiantan@nju.edu.cn>
++ * Copyright (C) 2022 Yue Li <yueli@nju.edu.cn>
++ *
++ * This file is part of Tai-e.
++ *
++ * Tai-e is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * Tai-e is distributed in the hope that it will be useful,but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General
++ * Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with Tai-e. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package pascal.taie.analysis.bugfinder;
++
++import pascal.taie.Main;
++import pascal.taie.World;
++import pascal.taie.language.classes.JClass;
++
++import javax.tools.ToolProvider;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++
++final class BytecodeBugFinderTests {
++
++    private BytecodeBugFinderTests() {
++    }
++
++    static JClass analyze(String fixture, String analysis, Path directory) throws IOException {
++        Path classes = Files.createDirectories(directory.resolve("classes"));
++        Path source = Path.of("src/test/resources/bugfinder", fixture + ".java");
++        var compiler = ToolProvider.getSystemJavaCompiler();
++        assertNotNull(compiler, "A JDK is required for bytecode regression tests");
++        ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
++        int exit = compiler.run(null, diagnostics, diagnostics, "-g", "-proc:none",
++                "-d", classes.toString(), source.toString());
++        assertEquals(0, exit, diagnostics.toString(StandardCharsets.UTF_8));
++        var args = new java.util.ArrayList<>(java.util.List.of("-acp", classes.toString(), "-a", analysis,
++                "--output-dir", directory.resolve("output").toString()));
++        if (analysis.equals(DivisionByZero.ID)) {
++            args.addAll(java.util.List.of("-a", "throw=exception:all", "-a", "cfg=exception:all"));
++        }
++        Main.main(args.toArray(String[]::new));
++        JClass result = World.get().getClassHierarchy().getClass(fixture);
++        assertNotNull(result);
++        return result;
++    }
++
++    static Set<BugInstance> findings(JClass clazz, String method, String analysis) {
++        return clazz.getDeclaredMethod(method).getIR().getResult(analysis);
++    }
++}
+diff --git a/src/test/java/pascal/taie/analysis/bugfinder/DivisionByZeroTest.java b/src/test/java/pascal/taie/analysis/bugfinder/DivisionByZeroTest.java
+new file mode 100644
+index 0000000..0b45ee8
+--- /dev/null
++++ b/src/test/java/pascal/taie/analysis/bugfinder/DivisionByZeroTest.java
+@@ -0,0 +1,76 @@
++/*
++ * Tai-e: A Static Analysis Framework for Java
++ *
++ * Copyright (C) 2022 Tian Tan <tiantan@nju.edu.cn>
++ * Copyright (C) 2022 Yue Li <yueli@nju.edu.cn>
++ *
++ * This file is part of Tai-e.
++ *
++ * Tai-e is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * Tai-e is distributed in the hope that it will be useful,but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General
++ * Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with Tai-e. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package pascal.taie.analysis.bugfinder;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import pascal.taie.Main;
++import pascal.taie.config.LoggerConfigs;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static pascal.taie.analysis.bugfinder.BytecodeBugFinderTests.findings;
++
++class DivisionByZeroTest {
++
++    @Test
++    void definiteIntegralZerosOnly(@TempDir Path directory) throws IOException {
++        var clazz = BytecodeBugFinderTests.analyze("DivisionByZeroCases", DivisionByZero.ID, directory);
++        for (String method : List.of("divide", "longDivide", "zeroBranches", "zeroLongBranches",
++                "refined", "promotedInt", "liveLongCondition")) {
++            var findings = findings(clazz, method, DivisionByZero.ID);
++            assertEquals(1, findings.size(), method);
++            BugInstance bug = findings.iterator().next();
++            assertEquals("INTEGER_DIVIDE_BY_ZERO", bug.getType().toString(), method);
++            assertTrue(bug.getSourceLineStart() > 0, method);
++        }
++        for (String method : List.of("remainder", "longRemainder")) {
++            var findings = findings(clazz, method, DivisionByZero.ID);
++            assertEquals(1, findings.size(), method);
++            assertEquals("INTEGER_REMAINDER_BY_ZERO", findings.iterator().next().getType().toString());
++        }
++        for (String method : List.of("unknown", "unknownLong", "nonzero", "largeLong", "floating",
++                "floatingRemainder", "mixedBranch", "mixedLongBranch", "unreachable", "unreachableLong", "loop")) {
++            assertTrue(findings(clazz, method, DivisionByZero.ID).isEmpty(), method);
++        }
++        var caught = findings(clazz, "caught", DivisionByZero.ID);
++        assertEquals(2, caught.size(), "both the try and its arithmetic-exception handler execute");
++        assertEquals(List.of("INTEGER_DIVIDE_BY_ZERO", "INTEGER_REMAINDER_BY_ZERO"),
++                caught.stream().map(bug -> bug.getType().toString()).sorted().toList());
++        try {
++            var missingModel = assertThrows(RuntimeException.class, () -> Main.main(new String[]{
++                    "-acp", directory.resolve("classes").toString(), "-a", DivisionByZero.ID,
++                    "--output-dir", directory.resolve("missing-model").toString()}));
++            assertTrue(missingModel.toString().contains("implicit-exception modeling"));
++        } finally {
++            // Main only resets logging after a successful run; release the file
++            // handle after the expected failure so Windows can delete @TempDir.
++            LoggerConfigs.reconfigure();
++        }
++    }
++}
+diff --git a/src/test/java/pascal/taie/analysis/bugfinder/NullLiteralBytecodeTest.java b/src/test/java/pascal/taie/analysis/bugfinder/NullLiteralBytecodeTest.java
+new file mode 100644
+index 0000000..3166afb
+--- /dev/null
++++ b/src/test/java/pascal/taie/analysis/bugfinder/NullLiteralBytecodeTest.java
+@@ -0,0 +1,53 @@
++/*
++ * Tai-e: A Static Analysis Framework for Java
++ *
++ * Copyright (C) 2022 Tian Tan <tiantan@nju.edu.cn>
++ * Copyright (C) 2022 Yue Li <yueli@nju.edu.cn>
++ *
++ * This file is part of Tai-e.
++ *
++ * Tai-e is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * Tai-e is distributed in the hope that it will be useful,but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General
++ * Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with Tai-e. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package pascal.taie.analysis.bugfinder;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import pascal.taie.analysis.bugfinder.nullpointer.NullPointerDetection;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static pascal.taie.analysis.bugfinder.BytecodeBugFinderTests.findings;
++
++class NullLiteralBytecodeTest {
++
++    @Test
++    void nullLiteralDereferencesReportInsteadOfCrashing(@TempDir Path directory) throws IOException {
++        var clazz = BytecodeBugFinderTests.analyze("NullLiteralBytecode", NullPointerDetection.ID, directory);
++        for (String method : List.of("fails", "nullArray")) {
++            var findings = findings(clazz, method, NullPointerDetection.ID);
++            assertEquals(1, findings.size(), method);
++            BugInstance bug = findings.iterator().next();
++            assertEquals("NP_ALWAYS_NULL", bug.getType().toString(), method);
++            assertTrue(bug.getSourceLineStart() > 0, method);
++        }
++        for (String method : List.of("guarded", "clean")) {
++            assertTrue(findings(clazz, method, NullPointerDetection.ID).isEmpty(), method);
++        }
++    }
++}
+diff --git a/src/test/resources/bugfinder/DivisionByZeroCases.java b/src/test/resources/bugfinder/DivisionByZeroCases.java
+new file mode 100644
+index 0000000..b00b689
+--- /dev/null
++++ b/src/test/resources/bugfinder/DivisionByZeroCases.java
+@@ -0,0 +1,134 @@
++class DivisionByZeroCases {
++
++    static int divide(int numerator) {
++        int divisor = 0;
++        return numerator / divisor;
++    }
++
++    static int remainder(int numerator) {
++        int divisor = 0;
++        return numerator % divisor;
++    }
++
++    static long longDivide(long numerator) {
++        long divisor = 3L;
++        divisor -= 3L;
++        return numerator / divisor;
++    }
++
++    static long longRemainder(long numerator) {
++        long divisor = 0L;
++        return numerator % divisor;
++    }
++
++    static int unknown(int numerator, int divisor) {
++        return numerator / divisor;
++    }
++
++    static long unknownLong(long numerator, long divisor) {
++        return numerator / divisor;
++    }
++
++    static int nonzero(int numerator) {
++        int divisor = 2;
++        return numerator / divisor;
++    }
++
++    static long largeLong(long numerator) {
++        long divisor = 0x100000000L;
++        return numerator / divisor;
++    }
++
++    static double floating(double numerator) {
++        double divisor = 0.0;
++        return numerator / divisor;
++    }
++
++    static float floatingRemainder(float numerator) {
++        float divisor = 0.0f;
++        return numerator % divisor;
++    }
++
++    static int mixedBranch(boolean flag) {
++        int divisor;
++        if (flag) divisor = 0;
++        else divisor = 2;
++        return 5 / divisor;
++    }
++
++    static int zeroBranches(boolean flag) {
++        int divisor;
++        if (flag) divisor = 0;
++        else divisor = 0;
++        return 5 / divisor;
++    }
++
++    static long mixedLongBranch(boolean flag) {
++        long divisor;
++        if (flag) divisor = 0L;
++        else divisor = 2L;
++        return 5L / divisor;
++    }
++
++    static long zeroLongBranches(boolean flag) {
++        long divisor;
++        if (flag) divisor = 0L;
++        else divisor = 0L;
++        return 5L / divisor;
++    }
++
++    static int unreachable(int numerator) {
++        int flag = 1;
++        if (flag == 2) {
++            int divisor = 0;
++            return numerator / divisor;
++        }
++        return 0;
++    }
++
++    static int refined(int numerator, int divisor) {
++        if (divisor == 0) return numerator / divisor;
++        return 0;
++    }
++
++    static int unreachableLong(int numerator) {
++        long flag = 1L;
++        if (flag == 2L) {
++            int divisor = 0;
++            return numerator / divisor;
++        }
++        return 0;
++    }
++
++    static long liveLongCondition(long numerator) {
++        long flag = 1L;
++        if (flag == 1L) {
++            long divisor = 0L;
++            return numerator / divisor;
++        }
++        return 0;
++    }
++
++    static long promotedInt(long numerator) {
++        int divisor = 0;
++        return numerator / divisor;
++    }
++
++    static int caught(int numerator) {
++        int result;
++        try {
++            int divisor = 0;
++            result = numerator / divisor;
++        } catch (ArithmeticException failure) {
++            int divisor = 0;
++            return numerator % divisor;
++        }
++        return result;
++    }
++
++    static long loop(long numerator) {
++        long divisor = 1L;
++        for (int i = 0; i < 5; i++) divisor++;
++        return numerator / divisor;
++    }
++}
+diff --git a/src/test/resources/bugfinder/NullLiteralBytecode.java b/src/test/resources/bugfinder/NullLiteralBytecode.java
+new file mode 100644
+index 0000000..24d5660
+--- /dev/null
++++ b/src/test/resources/bugfinder/NullLiteralBytecode.java
+@@ -0,0 +1,22 @@
++class NullLiteralBytecode {
++
++    static int fails() {
++        String message = null;
++        return message.length();
++    }
++
++    static int guarded(String message) {
++        if (message == null) return 0;
++        return message.length();
++    }
++
++    static int clean() {
++        String message = "hello";
++        return message.length();
++    }
++
++    static int nullArray() {
++        int[] values = null;
++        return values[0];
++    }
++}
