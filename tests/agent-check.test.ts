@@ -50,3 +50,29 @@ test('hidden dependency details are unavailable rather than an empty successful 
   assert.match(dependency.message ?? '', /hidden by the host/);
   assert.equal(dependency.stages.review, 'not_run');
 });
+
+test('finding query limits also exclude full baseline comparison evidence', () => {
+  const check = report();
+  const selected = check.findings[0];
+  const others = Array.from({ length: 25 }, (_, index) => ({ ...selected, id: `other-${index}`, message: `unrequested-evidence-${index}` }));
+  check.findings.push(...others);
+  check.findingCounts.project = check.findings.length;
+  check.comparison = {
+    schemaVersion: 1, status: 'compared', baselineReportPath: '/baseline/check.json', currentReportPath: check.reportPath,
+    baselineStatus: 'findings', currentStatus: check.status,
+    stageChanges: { build: { before: 'passed', after: 'passed' }, test: { before: 'passed', after: 'failed' },
+      analysis: { before: 'completed', after: 'completed' } },
+    counts: { added: others.length, removed: 1, persisting: 1, changed: 0 }, added: others,
+    removed: [{ ...selected, id: 'baseline-only', message: 'unrequested-baseline-evidence' }],
+    persisting: [{ before: selected, after: selected }], changed: [], limitations: ['Comparison does not prove correctness.'],
+  };
+  for (const query of [{ limit: 1 }, { id: selected.id, limit: 1 }]) {
+    const result = findingEvidence(check, query);
+    assert.deepEqual(result.findings, [selected]);
+    assert.equal(result.comparison?.status, 'compared');
+    assert.deepEqual(result.comparison?.counts, check.comparison.counts);
+    assert.deepEqual(result.comparison?.stageChanges, check.comparison.stageChanges);
+    for (const key of ['added', 'removed', 'persisting', 'changed']) assert.equal(key in result.comparison!, false);
+    assert.doesNotMatch(JSON.stringify(result), /unrequested-(?:evidence|baseline-evidence)/);
+  }
+});

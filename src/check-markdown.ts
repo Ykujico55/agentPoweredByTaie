@@ -45,6 +45,12 @@ function findingDetails(result: CheckResult, findings: Finding[]): string[] {
       : '未取得源码路径';
     const lines = finding.startLine === undefined ? ''
       : `，第 ${finding.startLine}${finding.endLine !== undefined && finding.endLine !== finding.startLine ? `–${finding.endLine}` : ''} 行`;
+    const comparison = result.comparison;
+    const change = finding.origin !== 'dependency' && comparison?.status === 'compared'
+      ? comparison.added?.some(item => item.id === finding.id) ? '新增'
+        : comparison.changed?.some(item => item.after.id === finding.id) ? '变化（候选对应关系，需复核）'
+          : comparison.persisting?.some(item => item.after.id === finding.id) ? '延续' : undefined
+      : undefined;
     return [
       `### ${index + 1}. ${text(finding.type)}`, '',
       `- 规则：${text(finding.ruleId ?? `${finding.analysis}/${finding.type}`)}`,
@@ -53,11 +59,35 @@ function findingDetails(result: CheckResult, findings: Finding[]): string[] {
       ...(finding.className ? [`- 类：${text(finding.className)}`] : []),
       ...(finding.method ? [`- 方法：${text(finding.method)}`] : []),
       `- 告警 ID：${text(finding.id)}`,
+      ...(change ? [`- 相对修改前基线：${change}`] : []),
       '- 复核：未运行，尚未判定是真实缺陷还是误报', '',
       '检测器原始说明：', '', block(finding.message), '',
       ...(finding.snippet ? ['源码片段：', '', block(finding.snippet, 'java'), ''] : []),
     ];
   });
+}
+
+function comparisonSection(result: CheckResult): string[] {
+  const comparison = result.comparison;
+  if (!comparison) return [];
+  const lines = ['## 与修改前基线对比', '',
+    `基线检查状态：${text(comparison.baselineStatus)}；本次检查状态：${text(comparison.currentStatus)}。`, '',
+    fileLink(result, comparison.baselineReportPath, '查看修改前基线证据'), ''];
+  if (comparison.status !== 'compared' || !comparison.counts) {
+    return [...lines, `**无法可靠对比**：${text(comparison.reason ?? comparison.status)}。`, '',
+      '未计算新增或消失数量，不能将未完成的检查当作零告警基线。', ''];
+  }
+  const { counts, stageChanges } = comparison;
+  return [...lines,
+    '| 项目告警变化 | 数量 |', '| --- | ---: |',
+    `| 新增 | ${counts.added} |`, `| 延续 | ${counts.persisting} |`,
+    `| 变化 | ${counts.changed} |`, `| 消失（本次未再报告） | ${counts.removed} |`, '',
+    ...(stageChanges ? [`阶段状态：构建 ${text(stageChanges.build.before)} → ${text(stageChanges.build.after)}；测试 ${text(stageChanges.test.before)} → ${text(stageChanges.test.after)}；分析 ${text(stageChanges.analysis.before)} → ${text(stageChanges.analysis.after)}。`, ''] : []),
+    '对比仅描述告警变化，不改变本次验收结论。遗留告警仍计入项目检查；告警消失不证明修复正确，源码删除等变化也可能使告警消失。', '',
+    ...(comparison.removed?.length ? ['本次未再报告的基线告警：', '', ...comparison.removed.map(finding =>
+      `- ${text(finding.ruleId ?? `${finding.analysis}/${finding.type}`)} · ${text(finding.method ?? finding.className ?? '位置未提供')} · ID：${text(finding.id)}`), ''] : []),
+    ...comparison.limitations.map(limitation => `- ${text(limitation)}`), '',
+  ];
 }
 
 /** A deterministic, human-readable view of recorded evidence; no model judgments are added. */
@@ -82,6 +112,7 @@ export function renderCheckMarkdown(result: CheckResult): string {
     `测试记录：共 ${stages.test.tests} 个，失败 ${stages.test.failures} 个，错误 ${stages.test.errors} 个，跳过 ${stages.test.skipped} 个。`, '',
     ...(result.backend === 'javac' ? ['javac 后端不执行项目测试，因此即使编译与分析成功，也不能得到完整检查通过的结论。', ''] : []),
     ...(result.status === 'stale' ? ['本次结果对应的输入已发生变化，应对当前版本重新检查。', ''] : []),
+    ...comparisonSection(result),
     '## 已记录告警', '',
     '| 归属 | 数量 |', '| --- | ---: |',
     `| 项目代码 | ${findingCounts.project} |`,

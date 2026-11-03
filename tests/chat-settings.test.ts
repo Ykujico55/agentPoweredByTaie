@@ -13,7 +13,7 @@ function settings(): ChatSettings {
 }
 
 test('the settings registry covers every configurable CLI setting exactly once', () => {
-  const keys = ['project', 'build-backend', 'dependency-network', 'include-dependencies', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+  const keys = ['project', 'build-backend', 'dependency-network', 'baseline', 'include-dependencies', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
     'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
     'taint-implicit-entries', 'java-version', 'jar', 'json'];
   assert.deepEqual(CHAT_SETTING_REGISTRY.map(entry => entry.key), keys);
@@ -44,6 +44,7 @@ test('scalar settings accept valid choices and integer boundaries while rejectin
   const cases: [string, string, (result: ChatSettings) => unknown, unknown][] = [
     ['build-backend', 'maven-docker', result => result.config.buildBackend, 'maven-docker'],
     ['dependency-network', 'on', result => result.config.dependencyNetwork, true],
+    ['baseline', 'off', result => result.config.baselineEnabled, false],
     ['include-dependencies', 'off', result => result.config.includeDependencies, false],
     ['provider', 'another-provider', result => result.provider, 'another-provider'],
     ['model', '"new-model"', result => result.model, 'new-model'],
@@ -60,7 +61,7 @@ test('scalar settings accept valid choices and integer boundaries while rejectin
   ];
   for (const [key, value, read, expected] of cases) assert.deepEqual(read(applySetting(settings(), key, value)), expected, key);
   for (const [key, values] of [
-    ['build-backend', ['gradle', 'host']], ['dependency-network', ['yes']], ['include-dependencies', ['1']],
+    ['build-backend', ['gradle', 'host']], ['dependency-network', ['yes']], ['baseline', ['yes']], ['include-dependencies', ['1']],
     ['max-repairs', ['-1', 'NaN', '1.5', '1e3', '0xff', '9007199254740992']],
     ['max-turns', ['0', '-1']], ['timeout', ['0', 'Infinity']], ['analysis-timeout', ['0']],
     ['java-version', ['7', '17.0']], ['repair-mode', ['yes']], ['analysis', ['yes']],

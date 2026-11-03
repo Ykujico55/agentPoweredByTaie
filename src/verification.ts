@@ -2,17 +2,24 @@ import type { CheckResult } from "./check.ts";
 
 export type Outcome = "verified" | "skipped" | "unresolved" | "check_failed" | "incomplete" | "agent_error";
 export type RepairMode = "ask" | "auto" | "off";
+export interface BaselineResult {
+  /** completed means the baseline was captured, not that every quality gate passed. */
+  status: "completed" | "failed" | "disabled" | "skipped";
+  check?: CheckResult;
+  error?: string;
+}
 export interface VerificationResult {
   schemaVersion: 2;
   outcome: Outcome;
   checks: CheckResult[];
+  baseline: BaselineResult;
   repairRounds: number;
   error?: string;
 }
 
 export interface VerificationOptions {
   prompt: (text: string) => Promise<void>;
-  analyze: () => Promise<CheckResult>;
+  analyze: (baseline?: CheckResult) => Promise<CheckResult>;
   task: string;
   maxRepairs: number;
   /** Existing API callers retain automatic repair when this is omitted. */
@@ -20,6 +27,9 @@ export interface VerificationOptions {
   confirmRepair?: (report: CheckResult, nextRound: number) => Promise<boolean>;
   /** Skip the complete host check for this task; the outcome remains unverified. */
   skipTaie?: boolean;
+  /** Capture the unmodified project before the first prompt. Enabled by default. */
+  baselineEnabled?: boolean;
+  onBaseline?: (baseline: BaselineResult) => void;
   onCheck?: (report: CheckResult) => void;
 }
 
@@ -52,11 +62,21 @@ function unfinishedOutcome(report: CheckResult): Outcome {
 /** The host owns a fresh build, project test and analysis check after each model response. */
 export async function verifyTask(options: VerificationOptions): Promise<VerificationResult> {
   const checks: CheckResult[] = [];
+  let baseline: BaselineResult = { status: options.skipTaie ? "skipped" : "disabled" };
   let repairRounds = 0;
   let nextPrompt = options.task;
   const finish = (outcome: Outcome, error?: unknown): VerificationResult => ({
-    schemaVersion: 2, outcome, checks, repairRounds, ...(error === undefined ? {} : { error: String(error) }),
+    schemaVersion: 2, outcome, checks, baseline, repairRounds, ...(error === undefined ? {} : { error: String(error) }),
   });
+  if (!options.skipTaie && options.baselineEnabled !== false) {
+    try {
+      const check = await options.analyze();
+      baseline = { status: ["passed", "findings", "tests_not_run"].includes(check.status) ? "completed" : "failed", check };
+    } catch (error) {
+      baseline = { status: "failed", error: String(error) };
+    }
+  }
+  options.onBaseline?.(baseline);
   for (;;) {
     try {
       await options.prompt(nextPrompt);
@@ -68,7 +88,7 @@ export async function verifyTask(options: VerificationOptions): Promise<Verifica
     }
     let report: CheckResult;
     try {
-      report = await options.analyze();
+      report = await options.analyze(baseline.check);
     } catch (error) {
       return finish("check_failed", error);
     }
@@ -95,6 +115,7 @@ export async function verifyTask(options: VerificationOptions): Promise<Verifica
       "Review the build, test and static-analysis evidence below. Fix the reported code defects, compilation errors or failing behavior while preserving the requested functionality.",
       "Read the report and test/log evidence if this summary is insufficient. Do not claim an unreviewed warning is a false positive.",
       "Project findings and dependency findings have different origins. Do not change third-party libraries to clear project checks.",
+      "When a comparison is present, it is against the project before this task. Existing findings still count; a removed finding is not proof of a correct fix or a false-positive decision.",
       "Do not remove functionality, suppress detectors, alter analysis or build configuration, modify/delete/skip existing tests, or fabricate passing test results to make a check pass.",
       "Missing tests are not a passing result. The javac backend does not execute project tests; do not repeatedly repair code merely because its test stage is not_run.",
       "You may invoke taie_analyze to inspect your edits. The host will independently verify again after you finish.",
@@ -112,6 +133,13 @@ export function formatReport(report: CheckResult): string {
     stages: report.stages, findingCounts: report.findingCounts,
     reportPath: report.reportPath, humanReportPath: report.humanReportPath,
     backendReportPath: report.backendReportPath, backendStatus: report.backendStatus,
+    comparison: report.comparison && {
+      status: report.comparison.status, reason: report.comparison.reason,
+      baselineReportPath: report.comparison.baselineReportPath, currentReportPath: report.comparison.currentReportPath,
+      baselineStatus: report.comparison.baselineStatus, currentStatus: report.comparison.currentStatus,
+      stageChanges: report.comparison.stageChanges, counts: report.comparison.counts,
+      limitations: report.comparison.limitations,
+    },
     analyses: report.analyses, diagnostics: report.diagnostics, findings: report.findings,
     limitations: report.limitations,
   }, null, 2);

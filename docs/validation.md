@@ -317,3 +317,19 @@ CLI 默认 `ask`；为兼容已有程序接口，直接调用 agent API 且省�
 证据：[运行记录](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/result.json)、[批准前的失败质检报告](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/project/.taie-agent/maven-runs/2026-11-03T06-43-29-079Z-0afbfcd9/check.md)、[最终质检报告](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/project/.taie-agent/maven-runs/2026-11-03T06-48-04-189Z-36a97ff2/check.md)。同目录保留提示、修复前后 Java 文件、模型事件及各阶段后端日志。
 
 原有 javac live 脚本已适配 `incomplete/tests_not_run` 和新报告结构，本轮仅做类型检查，未重新执行它们或原生检测器套件。当前仍执行模型检查与新鲜宿主检查，不复用前者；Maven 构建、测试和分析在容器执行，模型 shell/文件工具仍使用宿主权限。只读误报复核与隔离候选补丁尚未实现。
+
+## 修改前基线与告警变化对比
+
+验证日期：2026-11-03（Asia/Shanghai）。模型任务默认在首次提示前采集一次真实检查基线；模型工具与后续宿主检查始终比较本轮原始基线。基线独立保存，不计入最终检查或修复轮数；失败仍允许原始编写任务继续。`--baseline off` 或 `/set baseline off` 只关闭基线，最终检查保留；`--skip-taie` 同时跳过两者。手动 `/check` 保持单次检查。
+
+比较只处理项目告警，区分新增、延续、变化、消失。构建/分析未完成或环境指纹不兼容时不输出增减数字；测试失败但分析完成时可以比较静态告警，同时保留失败状态。既有告警不会被豁免，消失不等于修复正确。环境指纹使用记录的分析器、适配器、运行 JDK、编译设置、入口、规则和依赖内容；Maven 另含镜像、快照 POM/`.mvn` 与有效 POM。它是兼容性检查，不是完整环境等价或覆盖保证。
+
+- `npm run typecheck` 通过。宿主回归 **112 项通过、1 项跳过、0 失败**；跳过项为 Windows 环境不允许创建符号链接，目录 classpath 内容变化测试已执行。随后收紧 `taie_get_finding` 的比较输出，避免完整比较数组绕过查询 `limit`；新增查询测试及相关上下文测试 **8 项通过、1 项同原因跳过**，类型检查再次通过。
+- 另外完成仅本地 CLI 操作，确认 `--baseline off`、`/set baseline on` 与 `/config` 生效；设置面板现为 22 项。未请求真实模型。
+- 执行 `npm run test:baseline`，由脚本确定性修改 Java，实际运行四次 javac/Tai-e。第一轮基线有 2 条吞异常告警，修改后仍有 2 条，但正确分成 **新增 1、延续 1、消失 1、变化 0**；仅移动行号的告警 ID 保持不变。结果为 `unresolved`。第二轮消除剩余两条，比较为消失 2，结果仍为 `incomplete`，因为 javac 不执行项目测试。四次检查耗时分别为 25.45、20.33、19.39、19.18 秒；基线报告未被后续修复覆盖。
+
+真实 Java 证据：[运行记录](../.taie-agent/baseline-smoke/2026-11-03T07-18-40-617Z/result.json)、[新增与遗留告警对比报告](../.taie-agent/baseline-smoke/2026-11-03T07-18-40-617Z/project/.taie-agent/runs/2026-11-03T07-19-06-294Z-0526b229/check.md)、[清除告警但测试未运行的报告](../.taie-agent/baseline-smoke/2026-11-03T07-18-40-617Z/project/.taie-agent/runs/2026-11-03T07-19-46-087Z-dde5caff/check.md)。这是脚本修改与真实分析验证，不是新一次真实模型修复实验。
+
+另执行 `node scripts/replay-baseline-maven.ts`，回放上节既有真实 Maven 失败/通过报告。源码和快照指纹不同，分析环境指纹相同；比较保留测试 `failed → passed`，项目告警增减均为 0，依赖计数 `0 → 71` 不污染项目比较。四份原始 Maven/分析报告 SHA-256 未变。证据：[回放记录](../.taie-agent/baseline-maven-replay/2026-11-03T07-20-44-283Z-3d54bcef/result.json)、[回放对比报告](../.taie-agent/baseline-maven-replay/2026-11-03T07-20-44-283Z-3d54bcef/current/check.md)。此步骤只消费历史证据，没有重新运行 Maven、Tai-e 或模型 API。
+
+本阶段未实现只读误报复核、人工告警处置或隔离候选补丁；新报告中的复核状态仍为 `not_run`。

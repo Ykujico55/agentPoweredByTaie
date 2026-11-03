@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { renderCheckMarkdown } from '../src/check-markdown.ts';
 import type { CheckResult } from '../src/check.ts';
+import { compareChecks } from '../src/comparison.ts';
 
 function result(): CheckResult {
   const projectDir = path.resolve('project #中文');
@@ -19,6 +20,32 @@ function result(): CheckResult {
     diagnostics: [], limitations: ['An empty result is not proof of correctness.'],
   };
 }
+
+test('baseline differences remain visible without turning disappearance or a failed baseline into a clean result', () => {
+  const before = result();
+  const after = result();
+  before.comparisonKey = after.comparisonKey = 'same-analysis-context';
+  before.status = 'findings';
+  before.findings = [{ id: 'old', origin: 'project', analysis: 'dead-code', type: 'DEAD_CODE',
+    className: 'example.Main', method: '<example.Main: void oldMethod()>', message: 'old finding' }];
+  before.findingCounts.project = 1;
+  after.status = 'findings';
+  after.findings = [{ ...before.findings[0], id: 'new', method: '<example.Main: void newMethod()>' }];
+  after.findingCounts.project = 1;
+  after.comparison = compareChecks(before, after);
+  const markdown = renderCheckMarkdown(after);
+  assert.match(markdown, /\| 新增 \| 1 \|/);
+  assert.match(markdown, /\| 消失（本次未再报告） \| 1 \|/);
+  assert.match(markdown, /相对修改前基线：新增/);
+  assert.match(markdown, /告警消失不证明修复正确/);
+  assert.match(markdown, /oldMethod/);
+  before.status = 'analysis_failed';
+  before.stages.analysis = 'failed';
+  after.comparison = compareChecks(before, after);
+  const unavailable = renderCheckMarkdown(after);
+  assert.match(unavailable, /无法可靠对比/);
+  assert.doesNotMatch(unavailable, /\| 新增 \|/);
+});
 
 test('a readable report distinguishes project pass from hidden dependency findings and unrun review', () => {
   const report = result();

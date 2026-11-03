@@ -39,12 +39,12 @@ test('Maven configuration validates backend choices and keeps source discovery o
   const project = await mkdtemp(join(tmpdir(), 'taie-config-backend-'));
   try {
     await mkdir(join(project, 'src', 'main', 'java'), { recursive: true });
-    const config = { buildBackend: 'maven-docker' as const, dependencyNetwork: true, includeDependencies: false };
+    const config = { buildBackend: 'maven-docker' as const, baselineEnabled: false, dependencyNetwork: true, includeDependencies: false };
     await writeFile(join(project, 'taie-agent.json'), JSON.stringify(config));
     assert.deepEqual(await loadProjectConfig(project), config);
     assert.deepEqual(await freezeProjectConfig(project, config, ['src']), config, 'Maven must ignore prior javac inference');
     assert.deepEqual((await freezeProjectConfig(project, { buildBackend: 'javac' })).sourceRoots, ['src/main/java']);
-    for (const invalid of [{ buildBackend: 'gradle' }, { buildBackend: null }, { dependencyNetwork: 'on' }, { includeDependencies: 1 }]) {
+    for (const invalid of [{ buildBackend: 'gradle' }, { buildBackend: null }, { baselineEnabled: 'off' }, { dependencyNetwork: 'on' }, { includeDependencies: 1 }]) {
       await writeFile(join(project, 'taie-agent.json'), JSON.stringify(invalid));
       await assert.rejects(loadProjectConfig(project), new RegExp(Object.keys(invalid)[0]));
     }

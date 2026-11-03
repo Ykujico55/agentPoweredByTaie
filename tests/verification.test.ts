@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { formatReport, isCheckPassed, isRepairableCheck, verifyTask } from "../src/verification.ts";
+import { formatReport, isCheckPassed, isRepairableCheck, verifyTask as runVerification, type VerificationOptions } from "../src/verification.ts";
 import type { CheckResult } from "../src/check.ts";
+
+// These existing cases exercise post-task verification independently of the baseline.
+const verifyTask = (options: VerificationOptions) => runVerification({ baselineEnabled: false, ...options });
 
 function report(status: CheckResult["status"], hasFinding = false): CheckResult {
   return {
@@ -22,6 +25,123 @@ function report(status: CheckResult["status"], hasFinding = false): CheckResult 
     findingCounts: { project: hasFinding ? 1 : 0, dependency: 0, total: hasFinding ? 1 : 0 },
   };
 }
+
+test("the default baseline is captured before the original task and stays separate from final checks", async () => {
+  const baseline = report("findings", true);
+  const final = report("passed");
+  const order: string[] = [];
+  let scans = 0;
+  const result = await runVerification({
+    task: "Implement the requested feature", maxRepairs: 1, repairMode: "ask",
+    analyze: async previous => {
+      if (scans++ === 0) {
+        assert.equal(previous, undefined);
+        order.push("baseline");
+        return baseline;
+      }
+      assert.equal(previous, baseline);
+      order.push("final");
+      return final;
+    },
+    onBaseline: value => {
+      assert.deepEqual(value, { status: "completed", check: baseline });
+      order.push("baseline callback");
+    },
+    prompt: async text => { assert.equal(text, "Implement the requested feature"); order.push("model"); },
+    onCheck: value => { assert.equal(value, final); order.push("check callback"); },
+    confirmRepair: async () => { assert.fail("Pre-existing findings do not authorize a repair before the original task"); },
+  });
+  assert.deepEqual(order, ["baseline", "baseline callback", "model", "final", "check callback"]);
+  assert.equal(result.outcome, "verified");
+  assert.deepEqual(result.baseline, { status: "completed", check: baseline });
+  assert.deepEqual(result.checks, [final]);
+  assert.equal(result.repairRounds, 0);
+});
+
+test("failed baseline reports are preserved and still allow the original code-creation task", async () => {
+  for (const status of ["build_failed", "test_failed", "analysis_failed", "unsupported", "stale", "timeout", "error"] as const) {
+    const baseline = report(status, true);
+    let scans = 0;
+    let createdCode = false;
+    const result = await runVerification({
+      task: "Create a new Java project", maxRepairs: 0,
+      analyze: async previous => {
+        if (scans++ === 0) return baseline;
+        assert.equal(previous, baseline);
+        assert.equal(createdCode, true);
+        return report("passed");
+      },
+      prompt: async () => { createdCode = true; },
+    });
+    assert.equal(result.outcome, "verified");
+    assert.deepEqual(result.baseline, { status: "failed", check: baseline });
+    assert.equal(result.baseline.check?.findings.length, 1, "Partial baseline evidence must not become an empty clean baseline");
+    assert.equal(result.checks.length, 1);
+  }
+});
+
+test("a throwing baseline records failure without inventing a clean report or blocking code creation", async () => {
+  let scans = 0;
+  let prompted = false;
+  const result = await runVerification({
+    task: "Create the first source file", maxRepairs: 0,
+    analyze: async previous => {
+      assert.equal(previous, undefined);
+      if (scans++ === 0) throw new Error("No Java source files found");
+      assert.equal(prompted, true);
+      return report("passed");
+    },
+    prompt: async () => { prompted = true; },
+  });
+  assert.equal(result.outcome, "verified");
+  assert.deepEqual(result.baseline, { status: "failed", error: "Error: No Java source files found" });
+  assert.equal(result.checks.length, 1);
+  assert.equal(scans, 2);
+});
+
+test("all post-task checks receive the original baseline across authorized repair rounds", async () => {
+  const baseline = report("tests_not_run", true);
+  const first = report("findings", true);
+  const second = report("test_failed");
+  const final = report("passed");
+  const reports = [baseline, first, second, final];
+  const comparisons: (CheckResult | undefined)[] = [];
+  const approved: CheckResult[] = [];
+  let baselineCallbacks = 0;
+  const result = await runVerification({
+    task: "Add the feature", maxRepairs: 2, repairMode: "ask",
+    analyze: async previous => { comparisons.push(previous); return reports[comparisons.length - 1]; },
+    onBaseline: value => { baselineCallbacks++; assert.equal(value.status, "completed"); },
+    prompt: async () => {},
+    confirmRepair: async value => { approved.push(value); return true; },
+  });
+  assert.deepEqual(comparisons, [undefined, baseline, baseline, baseline]);
+  assert.deepEqual(approved, [first, second]);
+  assert.deepEqual(result.checks, [first, second, final]);
+  assert.equal(result.baseline.check, baseline);
+  assert.equal(baselineCallbacks, 1);
+  assert.equal(result.repairRounds, 2);
+  assert.equal(result.outcome, "verified");
+});
+
+test("baseline off keeps the final check while skip disables both checks", async () => {
+  for (const skipTaie of [false, true]) {
+    let scans = 0;
+    let prompts = 0;
+    const statuses: string[] = [];
+    const result = await runVerification({
+      task: "Write code", maxRepairs: 0, skipTaie,
+      ...(skipTaie ? {} : { baselineEnabled: false }),
+      prompt: async () => { prompts++; },
+      analyze: async previous => { assert.equal(previous, undefined); scans++; return report("passed"); },
+      onBaseline: value => { statuses.push(value.status); assert.equal(value.check, undefined); },
+    });
+    assert.equal(scans, skipTaie ? 0 : 1);
+    assert.equal(prompts, 1);
+    assert.deepEqual(statuses, [skipTaie ? "skipped" : "disabled"]);
+    assert.equal(result.outcome, skipTaie ? "skipped" : "verified");
+  }
+});
 
 test("the host analyzes after the model finishes without calling any tools", async () => {
   const order: string[] = [];
@@ -100,7 +220,7 @@ test("skipping Tai-e runs the task once without analysis, check callbacks, or re
     onCheck: () => { assert.fail("Skipped verification must not report a host check"); },
   });
   assert.deepEqual(prompts, ["Write code without Tai-e this round"]);
-  assert.deepEqual(result, { schemaVersion: 2, outcome: "skipped", checks: [], repairRounds: 0 });
+  assert.deepEqual(result, { schemaVersion: 2, outcome: "skipped", checks: [], baseline: { status: "skipped" }, repairRounds: 0 });
   assert.notEqual(result.outcome, "verified");
 });
 
@@ -416,9 +536,20 @@ test("dependency findings remain separate from the project gate and model repair
 test("a bounded model summary keeps stage decisions and report paths ahead of long findings", () => {
   const long = report("findings", true);
   long.findings[0].message = "evidence ".repeat(5000);
+  long.comparison = {
+    schemaVersion: 1, status: "compared", baselineReportPath: "/baseline/check.json", currentReportPath: long.reportPath,
+    baselineStatus: "findings", currentStatus: "findings",
+    stageChanges: { build: { before: "passed", after: "passed" }, test: { before: "passed", after: "passed" }, analysis: { before: "completed", after: "completed" } },
+    counts: { added: 1, removed: 0, persisting: 0, changed: 0 },
+    added: long.findings, removed: [], persisting: [], changed: [], limitations: ["A removed finding does not prove a fix."],
+  };
   const summary = formatReport(long);
   assert.match(summary, /"test"/);
   assert.match(summary, /"humanReportPath": "\/test-project\/check.md"/);
+  assert.match(summary, /"baselineReportPath": "\/baseline\/check.json"/);
+  assert.match(summary, /"added": 1/);
+  assert.match(summary, /A removed finding does not prove a fix/);
+  assert.ok(summary.indexOf('"comparison"') < summary.indexOf('"findings": ['));
   assert.match(summary, /\[Truncated; read full report: \/test-project\/check.json\]/);
   assert.ok(summary.length < 25_000);
   assert.equal(long.findings[0].message.length, 45000);

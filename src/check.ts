@@ -7,6 +7,8 @@ import type { ProcessResult } from './process.ts';
 import type { AnalysisReport, Finding } from './taie.ts';
 import { partitionFindings, projectClassNames } from './finding-origin.ts';
 import { renderCheckMarkdown } from './check-markdown.ts';
+import { buildComparisonKey } from './check-context.ts';
+import { compareChecks, type FindingComparison } from './comparison.ts';
 
 export interface CheckResult {
   schemaVersion: 1;
@@ -23,6 +25,8 @@ export interface CheckResult {
   analyses: string[];
   sourceFingerprint?: string;
   snapshotFingerprint?: string;
+  comparisonKey?: string;
+  comparison?: FindingComparison;
   analysisReportPath?: string;
   durationMs?: number;
   stages: {
@@ -45,11 +49,18 @@ export function findingEvidence(report: CheckResult, query: { id?: string; limit
   const origin = query.origin ?? 'project';
   const findings = origin === 'project' ? report.findings : report.dependencyFindings;
   const matches = findings?.filter(finding => !query.id || finding.id === query.id) ?? [];
+  const comparison = report.comparison;
   return {
     backend: report.backend, status: report.status, stages: report.stages, origin,
     sourceFingerprint: report.sourceFingerprint, snapshotFingerprint: report.snapshotFingerprint,
     reportPath: report.reportPath, humanReportPath: report.humanReportPath,
     backendReportPath: report.backendReportPath, analysisReportPath: report.analysisReportPath,
+    comparison: comparison ? {
+      schemaVersion: comparison.schemaVersion, status: comparison.status, reason: comparison.reason,
+      baselineReportPath: comparison.baselineReportPath, currentReportPath: comparison.currentReportPath,
+      baselineStatus: comparison.baselineStatus, currentStatus: comparison.currentStatus,
+      stageChanges: comparison.stageChanges, counts: comparison.counts, limitations: comparison.limitations,
+    } : undefined,
     detailsIncluded: findings !== undefined, totalRecorded: report.findingCounts[origin], totalMatches: matches.length,
     ...(findings === undefined ? { message: 'Dependency details are hidden by the host. Enable include-dependencies and run a new check to inspect them.' } : {}),
     findings: matches.slice(0, query.limit ?? 5),
@@ -120,20 +131,30 @@ export function normalizeJavacCheck(report: AnalysisReport, compile: ProcessResu
 }
 
 /** Host-only check. It neither initializes a model nor starts a repair round. */
-export async function checkProject(options: ProjectConfig & { projectDir: string; signal?: AbortSignal; taintConfigContent?: string }): Promise<CheckResult> {
-  const { buildBackend = 'javac', dependencyNetwork, includeDependencies, ...analysisOptions } = options;
+export async function checkProject(options: ProjectConfig & { projectDir: string; signal?: AbortSignal; taintConfigContent?: string; baseline?: CheckResult }): Promise<CheckResult> {
+  const { buildBackend = 'javac', dependencyNetwork, includeDependencies, baseline, baselineEnabled, ...analysisOptions } = options;
   let result: CheckResult;
+  let analysis: AnalysisReport | undefined;
+  let maven: MavenCheckResult | undefined;
   if (buildBackend === 'maven-docker') {
     const { checkMavenInDocker } = await import('./docker-maven.ts');
-    result = normalizeMavenCheck(await checkMavenInDocker({ ...analysisOptions, dependencyNetwork, includeDependencies }));
+    maven = await checkMavenInDocker({ ...analysisOptions, dependencyNetwork, includeDependencies });
+    analysis = maven.analysis;
+    result = normalizeMavenCheck(maven);
   } else {
     const { analyzeJavaProject } = await import('./taie.ts');
     const report = await analyzeJavaProject(analysisOptions);
+    analysis = report;
     const compile: ProcessResult | undefined = report.evidence.compileResult
       ? JSON.parse(await readFile(report.evidence.compileResult, 'utf8')) as ProcessResult : undefined;
     const classes = report.status === 'completed' ? await projectClassNames(path.join(report.runDir, 'classes')) : new Set<string>();
     result = normalizeJavacCheck(report, compile, classes, includeDependencies);
   }
+  if (analysis?.status === 'completed') {
+    try { result.comparisonKey = await buildComparisonKey(analysis, maven); }
+    catch (error) { result.diagnostics.push(`Finding comparison unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  if (baseline) result.comparison = compareChecks(baseline, result);
   return writeCheckReports(result);
 }
 
@@ -149,6 +170,9 @@ export function renderCheckResult(result: CheckResult): string {
   return [
     `[检查] ${result.status} · 后端 ${result.backend} · 项目告警 ${findingCounts.project} · 依赖告警 ${findingCounts.dependency}`,
     `构建: ${stages.build}；测试: ${stages.test.status}（${stages.test.tests} 个，失败 ${stages.test.failures}，错误 ${stages.test.errors}，跳过 ${stages.test.skipped}）；分析: ${stages.analysis}；复核: ${stages.review}`,
+    ...(result.comparison ? [result.comparison.counts
+      ? `相对基线：新增 ${result.comparison.counts.added}；消失 ${result.comparison.counts.removed}；仍存在 ${result.comparison.counts.persisting}；变化 ${result.comparison.counts.changed}`
+      : `基线比较：${result.comparison.status}；${result.comparison.reason ?? '无法比较'}`] : []),
     ...result.findings.slice(0, 10).map(finding => `  [project] ${finding.type}: ${finding.className ?? ''}${finding.startLine ? `:${finding.startLine}` : ''}`),
     ...(result.dependencyFindings?.slice(0, 10).map(finding => `  [dependency] ${finding.type}: ${finding.className ?? ''}${finding.startLine ? `:${finding.startLine}` : ''}`) ?? []),
     ...result.diagnostics,

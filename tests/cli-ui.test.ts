@@ -86,18 +86,20 @@ test('pretyped chat commands update effective settings without initializing an a
   await workspace(async directory => {
     const project = path.join(directory, 'empty project');
     const result = await runCli(['chat', '--project', project], [
-      '/config', '/repair off', '/analysis off', '/set max-repairs 3',
+      '/config', '/repair off', '/analysis off', '/set max-repairs 3', '/set baseline off',
       '/set analyses null-pointer,dead-code', '/config', '/exit',
     ], directory);
     assertLocal(result);
     const displayed = panels(result.stderr);
     assert.equal(displayed.length, 3);
     assert.equal(displayed[0]['repair-mode'], 'ask');
+    assert.equal(displayed[0].baseline, 'on');
     assert.equal(displayed[0].analysis, 'on');
     assert.equal(displayed[0]['max-repairs'], '2');
     const final = displayed.at(-1)!;
     assert.equal(final.project, JSON.stringify(project));
     assert.equal(final['repair-mode'], 'off');
+    assert.equal(final.baseline, 'off');
     assert.equal(final.analysis, 'off');
     assert.equal(final['max-repairs'], '3');
     assert.deepEqual(JSON.parse(final.analyses), ['null-pointer', 'dead-code']);
@@ -189,7 +191,7 @@ test('--help documents configurable settings, launch flags, and local chat comma
     const result = await runCli(['--help'], [], directory);
     assert.equal(result.timedOut, false);
     assert.equal(result.exitCode, 0, result.stderr);
-    for (const flag of ['project', 'build-backend', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+    for (const flag of ['project', 'build-backend', 'baseline', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
       'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
       'taint-implicit-entries', 'java-version', 'jar', 'json', 'prompt', 'prompt-file', 'skip-taie', 'no-repair', 'help',
       'dependency-network', 'include-dependencies']) {

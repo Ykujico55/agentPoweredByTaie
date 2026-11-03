@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 export interface ProjectConfig {
   buildBackend?: 'javac' | 'maven-docker';
+  baselineEnabled?: boolean;
   dependencyNetwork?: boolean;
   includeDependencies?: boolean;
   sourceRoots?: string[];
@@ -45,7 +46,7 @@ export async function loadProjectConfig(projectDir: string): Promise<ProjectConf
     throw new Error(`${path} must contain a JSON object.`);
   }
   const result = config as Record<string, unknown>;
-  const allowed = ["buildBackend", "dependencyNetwork", "includeDependencies", "sourceRoots", "classpath", "mainClass", "analyses", "javaVersion", "timeoutMs", "jarPath", "taintConfig", "taintImplicitEntries"];
+  const allowed = ["buildBackend", "baselineEnabled", "dependencyNetwork", "includeDependencies", "sourceRoots", "classpath", "mainClass", "analyses", "javaVersion", "timeoutMs", "jarPath", "taintConfig", "taintImplicitEntries"];
   for (const key of Object.keys(result)) {
     if (!allowed.includes(key)) throw new Error(`Unknown configuration key: ${key}`);
   }
@@ -66,7 +67,7 @@ export async function loadProjectConfig(projectDir: string): Promise<ProjectConf
   if (result.buildBackend !== undefined && result.buildBackend !== 'javac' && result.buildBackend !== 'maven-docker') {
     throw new Error('buildBackend must be javac or maven-docker.');
   }
-  for (const key of ['taintImplicitEntries', 'dependencyNetwork', 'includeDependencies']) {
+  for (const key of ['taintImplicitEntries', 'dependencyNetwork', 'includeDependencies', 'baselineEnabled']) {
     if (result[key] !== undefined && typeof result[key] !== 'boolean') {
       throw new Error(`${key} must be a boolean.`);
     }

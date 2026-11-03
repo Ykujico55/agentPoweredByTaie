@@ -6,7 +6,7 @@
 npm start -- chat --project examples/playground
 ```
 
-聊天中的 `/config` 和 `/settings` 显示同一份完整配置面板，包括全部 21 项设置、对应 CLI flag、有效默认值和解析后的绝对路径。`/help` 显示完整 CLI 帮助，`/exit` 退出聊天。
+聊天中的 `/config` 和 `/settings` 显示同一份完整配置面板，包括全部 22 项设置、对应 CLI flag、有效默认值和解析后的绝对路径。`/help` 显示完整 CLI 帮助，`/exit` 退出聊天。
 
 ```text
 /config
@@ -20,7 +20,7 @@ npm start -- chat --project examples/playground
 
 ## 手动检查 `/check`
 
-`/check` 直接调用宿主检查入口，无需模型凭据，不进行误报复核或修复。即使 `/analysis off`，显式 `/check` 仍执行；它不消耗已预定的 `--skip-taie` 或 `--no-repair`。检查期间 Ctrl+C 请求取消，保存部分证据并清理后返回聊天。
+`/check` 直接调用宿主检查入口，无需模型凭据，不进行误报复核或修复，也不额外采集基线，始终只检查一次。即使 `/analysis off`，显式 `/check` 仍执行；它不消耗已预定的 `--skip-taie` 或 `--no-repair`。检查期间 Ctrl+C 请求取消，保存部分证据并清理后返回聊天。
 
 例如，先按 [Maven 说明](maven-check.md) 构建镜像，再启动 `npm start -- chat --project tests/fixtures/maven-simple`：
 
@@ -61,9 +61,20 @@ npm start -- chat --project examples/playground
 {
   "buildBackend": "maven-docker",
   "dependencyNetwork": false,
-  "includeDependencies": false
+  "includeDependencies": false,
+  "baselineEnabled": true
 }
 ```
+
+## 修改前基线
+
+`run` / `chat` 的 `baseline` 默认 `on`：每轮启用检测的模型任务，在第一次模型提示前额外运行一次真实检查。后续模型工具检查和每次宿主验收都与这份原始基线比较，修复后不会替换基线。基线耗时计入任务 `timeout`，不计入修复次数或最终检查次数。
+
+启动时使用 `--baseline off`，或聊天输入 `/set baseline off`，只关闭后续任务的基线，模型工具与最终宿主验收保持启用；`/set baseline on` 恢复。`--skip-taie` 或会话 `/analysis off` 同时跳过基线和最终检查。配置命令与手动 `/check` 不启动基线。
+
+agent 结果中的 `baseline.status` 为 `completed`、`failed`、`disabled` 或 `skipped`。`completed` 表示采集完成，不表示无告警或测试已运行；`failed` 保留实际失败报告或异常。基线失败仍允许原始编写任务继续，不把空项目或失败分析伪装成零告警，也不自动授权修复与任务无关的既有问题。
+
+检查结果的 `comparison` 和中文 `check.md` 展示阶段变化，以及新增、消失、延续、变化的项目告警。依赖告警不参与这组计数；项目、后端、检测器或分析环境无法对应，或构建/分析证据不可用时不给增减数字。测试失败但构建和分析已完成时，可以比较静态告警，测试失败仍保留。告警消失不等于修复成功，变化不等于误报判定；最终验收仍要求实际测试通过、分析完成且全部项目告警清零，包括修改前已有告警。
 
 ## 修复策略
 
@@ -106,7 +117,7 @@ npm start -- chat --project examples/playground --repair-mode ask
 --skip-taie 先讨论设计
 ```
 
-`--no-repair` 相当于本轮使用 `repair-mode=off`，仍会运行已启用的检测并保留告警。`--skip-taie` 则停用本轮两个 Tai-e 工具，宿主不执行 Tai-e 编译、分析或修复循环；普通读写与 shell 工具仍可使用。两者都不会永久改变会话设置；下一条任务继续按会话默认值运行。单独输入这些标志，会把覆盖预定到下一条实际任务。
+`--no-repair` 相当于本轮使用 `repair-mode=off`，仍会运行已启用的检测并保留告警。`--skip-taie` 则停用本轮两个 Tai-e 工具，宿主不执行基线、最终检查或修复循环；普通读写与 shell 工具仍可使用。两者都不会永久改变会话设置；下一条任务继续按会话默认值运行。单独输入这些标志，会把覆盖预定到下一条实际任务。
 
 单次 CLI 任务也支持这两个选项：
 
@@ -142,6 +153,7 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 | `model` | `deepseek-v4-flash`，启动时可由环境变量覆盖 | `/set model deepseek-v4-flash` |
 | `repair-mode` | CLI 默认 `ask` | `/set repair-mode ask` |
 | `analysis` | 默认 `on` | `/set analysis off` |
+| `baseline` | 默认 `on`；每轮模型任务额外记录修改前检查 | `/set baseline off` |
 | `max-repairs` | 默认 `2`，最小 `0` | `/set max-repairs 1` |
 | `max-turns` | 默认 `30`，最小 `1` | `/set max-turns 40` |
 | `timeout` | 任务执行的毫秒预算，不含人工等待，默认 `600000` | `/set timeout 900000` |
@@ -190,13 +202,13 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 
 切换 `project` 会加载目标目录的 `taie-agent.json`，并开启新的 agent 会话，原项目的对话历史不带入新项目。全局模型选择、修复策略、模型轮数和任务时限等会话级预算继续保留。对于后端默认值，目标配置未指定 `jarPath` 或 `analyses` 时，分别沿用原会话的 JAR 或检测器组合；目标项目显式指定的值优先。
 
-构建后端、准备联网和依赖告警设置以目标项目配置为准；未配置时恢复 javac/off/off，不把原项目的联网设置带到新项目。javac 模型任务冻结的源码范围不因修改检测器等无关配置而重新推断；手动 `/check` 独立解析当前配置。
+构建后端、准备联网、依赖告警和基线设置以目标项目配置为准；未配置时分别恢复 javac/off/off/on，不把原项目的联网设置带到新项目。每轮任务重新采集基线，切换配置不复用旧基线。javac 模型任务冻结的源码范围不因修改检测器等无关配置而重新推断；手动 `/check` 独立解析当前配置。
 
 污点规则在首次实际分析时读取为快照，跳过分析的任务不会读取规则文件。修改分析配置后，后续任务使用更新后的配置；单次分析及其修复过程保持对应快照。只修改规则文件内容时，可先清除再设回策略路径，或开启新会话，以读取新快照；仅重复设置相同路径不会构成配置变更。
 
 ## 结果含义
 
-agent 结果现为 **`schemaVersion: 2`**，`checks` 保存统一 `CheckResult`（含 `stages`、项目/依赖计数、JSON 与 Markdown 路径），不再直接保存旧 `AnalysisReport`。`taie_analyze` 返回同一结构；`taie_get_finding` 默认查询项目告警，显式选择依赖归属且配置允许展示时才返回依赖详情。模型拿到的检查结果与最终宿主检查各自保留，宿主总会重新检查当前代码，不因模型工具刚报告通过就省略验收。
+agent 结果现为 **`schemaVersion: 2`**，`baseline` 单列修改前结果，`checks` 只保存任务后的统一 `CheckResult`（含 `stages`、项目/依赖计数、可用时的 `comparison`、JSON 与 Markdown 路径），不再直接保存旧 `AnalysisReport`。`taie_analyze` 返回同一结构；`taie_get_finding` 可读取最新检查，首次模型提示时也可读取已采集的基线，默认查询项目告警，显式选择依赖归属且配置允许展示时才返回依赖详情。模型拿到的检查结果与最终宿主检查各自保留，宿主总会重新检查当前代码，不因模型工具刚报告通过就省略验收。
 
 | `outcome` | 含义 |
 | --- | --- |
@@ -216,10 +228,13 @@ agent 结果现为 **`schemaVersion: 2`**，`checks` 保存统一 `CheckResult`�
 ```powershell
 npm run typecheck
 npm run test:host
+npm run test:baseline
 npm run test:live:policy
 npm run test:live:maven
 ```
 
 `test:host` 包含本地宿主、修复权限、配置面板和真实 CLI 子进程测试，不请求模型或运行 Java。`test:live:policy` 调用环境中的 DeepSeek API，使用私有合成示例验证 off、ask 拒绝、ask 同意三个阶段，并独立编译执行 Java 断言；会产生 API 用量。
+
+`test:baseline` 运行真实 Java/Tai-e，用脚本确定性修改示例并核验修改前后的告警比较；不调用模型 API，不将脚本修改当作真实模型修复能力的证据。
 
 `test:live:maven` 在项目副本中调用真实模型和 Maven 容器，先验证测试失败不能因零静态告警放行，再由测试程序批准一次修复并核验新的构建、测试和分析结果。默认总预算 900000 毫秒，可通过 `TAIE_SMOKE_TIMEOUT_MS` 调整；只使用已有离线依赖缓存。

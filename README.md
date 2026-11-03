@@ -1,6 +1,6 @@
 # Tai-e Coding Agent
 
-基于 **Pi SDK + Tai-e** 的 Java coding agent 原型。模型可以读写代码、执行命令、调用 `taie_analyze`；宿主在模型完成后独立执行一次新的质检。Maven 后端包含真实构建、项目测试与分析。CLI 默认采用 `repair-mode=ask`，发现项目告警、构建或测试错误后，先询问用户，再决定是否交回模型修复。讨论或其他无需检查的任务可以显式跳过本轮 Tai-e。
+基于 **Pi SDK + Tai-e** 的 Java coding agent 原型。模型可以读写代码、执行命令、调用 `taie_analyze`；宿主默认在模型动手前记录基线，完成后独立执行一次新的质检并对比告警。Maven 后端包含真实构建、项目测试与分析。CLI 默认采用 `repair-mode=ask`，发现项目告警、构建或测试错误后，先询问用户，再决定是否交回模型修复。讨论或其他无需检查的任务可以显式跳过本轮 Tai-e。
 
 当前阶段验证工程闭环，尚未进行模型或框架的比较实验。
 
@@ -45,7 +45,7 @@ npm start -- chat --project examples/playground
 
 ## 在聊天中配置和修复
 
-启动 `chat` 会显示完整的 21 项设置面板，包括 CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改；`/help` 显示完整 CLI 帮助。
+启动 `chat` 会显示完整的 22 项设置面板，包括 CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改；`/help` 显示完整 CLI 帮助。
 
 手动 `/check` 无需模型、不会修复，输出构建/测试/分析/复核阶段及项目/依赖告警。用 `/set build-backend maven-docker` 为模型工具、宿主验收和手动检查选择 Maven，`/set dependency-network on` 显式允许依赖准备联网。javac 未运行测试，干净检查状态为 `tests_not_run`，模型任务最终结果为 `incomplete`。完整说明见 [交互配置](docs/interactive-settings.md)。
 
@@ -56,6 +56,8 @@ npm start -- chat --project tests/fixtures/maven-simple --build-backend maven-do
 以上命令使用已有依赖缓存；首次准备可显式设为 `on`，检查阶段仍离线。模型编写代码后调用 `taie_analyze`，宿主随后独立复查。Maven 不可用时保留错误，不自动回退到宿主 javac。
 
 `/check` 和 `check-maven` CLI 每次都会同时生成中文 **`check.md` 质检报告**，包含结论、各阶段结果、告警详情和证据链接；命令行会显示其路径，现有 JSON 结果继续保留。
+
+模型任务的 `baseline` 默认 `on`，每轮额外执行一次真实检查，记录修改前状态；这部分耗时计入任务预算。启动时传 `--baseline off` 或聊天输入 `/set baseline off` 可以只关闭基线，仍保留模型工具和最终宿主验收。`--skip-taie` 同时跳过基线与最终检查；手动 `/check` 始终只检查一次。
 
 ```text
 /config
@@ -102,7 +104,7 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 
 第一条消息跳过检测，第二条恢复会话默认值（初始为开启）。单独输入 `--skip-taie` 会预定下一条实际任务跳过；通过 `npm start -- chat --skip-taie` 启动时，也只影响首条实际任务。该开关仅适用于 `run` / `chat`。
 
-跳过期间，两个 Tai-e 工具停用，宿主不执行为 Tai-e 准备的编译、分析和自动修复循环；读写代码和普通 shell 工具仍可使用。正常完成的结果为 `outcome: "skipped"`、`skipTaie: true`、`checks: []`、`repairRounds: 0`，CLI 退出码为 `0`。`skipped` 表示未做 Tai-e 验证，不属于 `verified`；模型调用失败或超时仍会报错。
+跳过期间，两个 Tai-e 工具停用，宿主不执行基线、最终检查和自动修复循环；读写代码和普通 shell 工具仍可使用。正常完成的结果为 `outcome: "skipped"`、`skipTaie: true`、`baseline.status: "skipped"`、`checks: []`、`repairRounds: 0`，CLI 退出码为 `0`。`skipped` 表示未做 Tai-e 验证，不属于 `verified`；模型调用失败或超时仍会报错。
 
 ## 单独分析 Java 项目
 
@@ -142,13 +144,16 @@ npm run analyze -- --project examples/clean
 
 以下是启用 Tai-e 时的流程；跳过的任务只执行模型任务并记录结果，下一条任务按照会话检测默认值运行。
 
-1. Pi 根据任务调用读写、编辑和 shell 工具，真正生成或修改代码。
-2. 模型可主动调用 `taie_analyze`，通过所选后端取得构建、测试、分析结果和中文质检报告。
-3. 模型停止后，宿主独立重新质检；javac 源码范围和分析配置保持冻结，Maven 每次从新快照的真实构建取得产物。污点规则在该配置首次分析时读取为快照。
-4. 有项目告警或可修复的构建/测试错误时，`ask` 每轮先征得同意，`auto` 自动将证据交回模型，`off` 保留结果；最多追加两轮修复，可用 `--max-repairs` 调整。单纯缺少测试或分析器/环境故障不会触发盲目修复。
-5. 返回机器可读的结果，不以模型自行声称“已通过”为准。
+1. 默认先检查未修改的项目，保存本轮基线。基线失败仍允许原任务继续，例如创建首个 Java 文件；保留失败证据，不伪造空的干净基线。
+2. Pi 根据任务调用读写、编辑和 shell 工具，真正生成或修改代码。
+3. 模型可主动调用 `taie_analyze`，通过所选后端取得构建、测试、分析结果和中文质检报告。
+4. 模型停止后，宿主独立重新质检；javac 源码范围和分析配置保持冻结，Maven 每次从新快照的真实构建取得产物。污点规则在该配置首次分析时读取为快照。
+5. 有项目告警或可修复的构建/测试错误时，`ask` 每轮先征得同意，`auto` 自动将证据交回模型，`off` 保留结果；最多追加两轮修复，可用 `--max-repairs` 调整。单纯缺少测试或分析器/环境故障不会触发盲目修复。
+6. 返回机器可读的结果，不以模型自行声称“已通过”为准。
 
-agent 结果协议为 `schemaVersion: 2`，`checks` 使用统一阶段报告。结果中的 `outcome`：
+agent 结果协议为 `schemaVersion: 2`，`baseline` 独立保存修改前检查，不计入 `checks` 或修复次数；后续检查的 `comparison` 及中文报告展示新增、消失、延续和变化的项目告警。环境不一致或构建/分析证据不可用时不计算增减数字。测试失败但构建和分析完成时仍可比较静态告警，测试失败状态保留。比较只描述两次报告的差异，不证明修复或误报，也不免除既有告警和失败测试。
+
+结果中的 `outcome`：
 
 | 值 | 含义 |
 | --- | --- |
@@ -172,11 +177,14 @@ agent 结果协议为 `schemaVersion: 2`，`checks` 使用统一阶段报告。�
 ```powershell
 npm run typecheck
 npm test
+npm run test:baseline
 npm run test:live
 npm run test:live:maven
 ```
 
 普通测试不请求模型，包含真实 `javac`/Tai-e 集成检查和宿主复查逻辑测试。`test:live` 使用环境中的 API key 请求模型，会产生正常 API 用量；脚本检查实际写入的 Java 文件、`taie_analyze` 工具调用、宿主分析证据，并独立编译和执行 Java 断言。证据保存在本仓库 `.taie-agent/live-smoke/`。
+
+`test:baseline` 运行真实 Java/Tai-e 检查，由脚本确定性修改示例，验证基线与修改后报告的比较；不调用模型 API，不代表真实模型已经正确完成修复。
 
 `test:live:maven` 使用离线 Maven 缓存与真实模型，验证“模型写入错误实现 → 测试失败但项目零静态告警 → 确认修复 → 模型修复 → 新的宿主检查通过”；测试同时确认 POM 和既有测试未被修改。javac 系列 live 脚本保留独立运行断言，但不把独立断言结果伪装成 agent 已执行的项目测试。
 

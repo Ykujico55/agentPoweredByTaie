@@ -61,6 +61,8 @@ const help = [
   "A clean javac /check is tests_not_run. Maven passed requires build, tests and analysis success; review remains not_run.",
   'Agent schemaVersion=2: "verified" requires fresh build, executed tests and analysis success with no project findings.',
   'Clean javac tasks return "incomplete" (exit 1); failed checks return "check_failed". Review remains not_run.',
+  'baseline=on records a fresh check before each model task; --baseline off disables only this extra check.',
+  'Baseline failures remain visible; finding differences never suppress existing findings or override test failures.',
   "",
 ].join("\n");
 
@@ -79,6 +81,7 @@ async function main() {
       "dependency-network": { type: "string" },
       "include-dependencies": { type: "boolean" },
       "build-backend": { type: "string" },
+      baseline: { type: "string" },
     },
   });
   if (values.help) { console.log(help); return; }
@@ -93,7 +96,7 @@ async function main() {
   if (command === 'check-maven' && values['build-backend'] !== undefined && values['build-backend'] !== 'maven-docker')
     throw new Error('check-maven requires --build-backend maven-docker.');
   if (command !== "run" && command !== "chat") {
-    for (const flag of ["skip-taie", "no-repair", "repair-mode", "analysis"] as const) {
+    for (const flag of ["skip-taie", "no-repair", "repair-mode", "analysis", "baseline"] as const) {
       if (values[flag] !== undefined) throw new Error("--" + flag + " applies only to run/chat, not analyze or doctor.");
     }
   }
@@ -126,7 +129,7 @@ async function main() {
     repairMode: "ask", analysisEnabled: true, maxRepairs: 2, maxTurns: 30, timeoutMs: 600_000, json: Boolean(values.json),
   };
   const raw = values as Record<string, unknown>;
-  for (const key of ["provider", "model", "analysis", "repair-mode", "max-repairs", "max-turns", "timeout", "analysis-timeout", "analyses", "main-class", "java-version", "taint-implicit-entries", "build-backend", "dependency-network"]) {
+  for (const key of ["provider", "model", "analysis", "repair-mode", "max-repairs", "max-turns", "timeout", "analysis-timeout", "analyses", "main-class", "java-version", "taint-implicit-entries", "build-backend", "dependency-network", "baseline"]) {
     if (typeof raw[key] === "string") settings = applySetting(settings, key, raw[key]);
   }
   if (values['include-dependencies'] !== undefined)
@@ -192,6 +195,12 @@ async function main() {
     if (report.diagnostics.length) console.error(report.diagnostics.join("\n").slice(-2000));
     console.error("质检报告：" + report.humanReportPath);
     console.error("JSON：" + report.reportPath);
+    if (report.comparison) {
+      const comparison = report.comparison;
+      if (comparison.status === 'compared' && comparison.counts)
+        console.error(`相对任务开始前：新增 ${comparison.counts.added}、延续 ${comparison.counts.persisting}、变化 ${comparison.counts.changed}、消失 ${comparison.counts.removed}。`);
+      else console.error('基线对比不可用：' + (comparison.reason ?? comparison.status));
+    }
     for (;;) {
       const answer = await input.ask("是否允许修改代码并重新检测？[y/N] > ");
       if (answer === undefined) return false;
@@ -235,6 +244,7 @@ async function main() {
     if (settings.json) console.log(JSON.stringify(report, null, 2));
     else {
       console.log("\n\n[taie-agent] " + report.outcome + "; repair: " + report.repairMode + "; host checks: " + report.checks.length + "; evidence: " + report.runDir);
+      console.log('[基线] ' + report.baseline.status + (report.baseline.check ? ' · ' + report.baseline.check.status + ' · ' + report.baseline.check.humanReportPath : ''));
       if (report.error) console.error("[taie-agent] " + report.error);
       else if (report.outcome === "unresolved") console.error("[taie-agent] 告警已保留。可用 /repair auto 或下一轮明确安排修复。");
       else if (report.outcome === "incomplete") console.error("[taie-agent] 检查未完成：项目测试未运行，不能视为通过。");

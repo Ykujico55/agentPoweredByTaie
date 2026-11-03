@@ -10,7 +10,7 @@ import { Type } from "typebox";
 import { checkProject, findingEvidence, type CheckResult } from "./check.ts";
 import type { ProjectConfig } from "./config.ts";
 import { freezeProjectConfig } from "./config.ts";
-import { verifyTask, formatReport, isCheckPassed, type VerificationResult, type RepairMode } from "./verification.ts";
+import { verifyTask, formatReport, isCheckPassed, type VerificationResult, type RepairMode, type BaselineResult } from "./verification.ts";
 import type { AgentTurnOptions } from "./turn.ts";
 import { guardRepairTools } from "./repair-guard.ts";
 
@@ -55,13 +55,14 @@ export async function createTaieAgent(options: AgentOptions) {
   let repairModeForTurn: RepairMode = options.repairMode ?? "auto";
   let writeLocked = false;
   let currentTaskSignal: AbortSignal | undefined;
-  const analyze = async (signal?: AbortSignal) => {
+  let taskBaseline: BaselineResult | undefined;
+  const analyze = async (signal?: AbortSignal, baseline?: CheckResult) => {
     if (skipTaieForTurn) throw new Error("Tai-e is disabled for the current user task.");
     taintConfigContentPromise ??= frozenConfig.taintConfig
       ? readFile(resolve(projectDir, frozenConfig.taintConfig), "utf8") : Promise.resolve(undefined);
     const signals = [signal, currentTaskSignal].filter((value): value is AbortSignal => value !== undefined);
     return checkProject({ ...frozenConfig, taintConfigContent: await taintConfigContentPromise,
-      projectDir, signal: signals.length ? AbortSignal.any(signals) : undefined });
+      projectDir, baseline, signal: signals.length ? AbortSignal.any(signals) : undefined });
   };
   let lastCheck: CheckResult | undefined;
   // No global model-catalog writes and no automatic downloads during a coding task.
@@ -99,6 +100,7 @@ export async function createTaieAgent(options: AgentOptions) {
       "Do not suppress analysis or fabricate tool results. A request to demonstrate a bug is not permission to fix it.",
       "A completed analysis without findings only covers the configured detectors; it is not a proof of general correctness.",
       "When Tai-e is enabled, the host performs another fresh check with the selected backend after you stop, and may send you repair feedback. Only passed checks can be verified; failed or unrun tests cannot be accepted because analysis found no bugs.",
+      "When baseline checking is enabled, the host records the project before your first prompt. Comparisons describe added, removed, persisting or changed project findings; they do not prove repairs or authorize unrelated changes. Existing findings still count in final verification.",
       "Only project findings drive the project gate. Dependency findings are separate evidence, not confirmed false positives. Do not modify dependency libraries to clear project checks.",
       "Do not read credentials or print API keys. Do not change taie-agent.json or files under .taie-agent.",
     ],
@@ -116,7 +118,7 @@ export async function createTaieAgent(options: AgentOptions) {
         content: [{ type: "text", text: "Tai-e is disabled for this user task. No compilation or analysis was performed." }],
         details: { status: "skipped" },
       };
-      const report = await analyze(signal);
+      const report = await analyze(signal, taskBaseline?.check);
       lastCheck = report;
       const cleanWithoutTests = report.status === 'tests_not_run' && report.stages.build === 'passed'
         && report.stages.analysis === 'completed' && report.findings.length === 0 && report.findingCounts.project === 0;
@@ -188,7 +190,7 @@ export async function createTaieAgent(options: AgentOptions) {
       if (next.provider !== settings.provider || next.model !== settings.model) await session.setModel(nextModel, { persist: false });
       settings = { ...next, config: structuredClone(next.config) };
       frozenConfig = nextConfig;
-      if (configChanged) { taintConfigContentPromise = undefined; lastCheck = undefined; }
+      if (configChanged) { taintConfigContentPromise = undefined; lastCheck = undefined; taskBaseline = undefined; }
       log({ type: "configuration_changed", config: frozenConfig, provider: settings.provider, model: settings.model, repairMode: settings.repairMode ?? "auto", maxRepairs: settings.maxRepairs, maxTurns: settings.maxTurns, timeoutMs: settings.timeoutMs });
     },
     async run(task: string, turnOptions: AgentTurnOptions = {}): Promise<VerificationResult & { runDir: string; toolCalls: string[]; model: string; finalText: string; skipTaie: boolean; repairMode: RepairMode; repairDecisions: { round: number; approved: boolean }[] }> {
@@ -200,6 +202,8 @@ export async function createTaieAgent(options: AgentOptions) {
       const repairMode = turnOptions.repairMode ?? settings.repairMode ?? "auto";
       repairModeForTurn = repairMode;
       writeLocked = false;
+      taskBaseline = undefined;
+      lastCheck = undefined;
       const activeTools = session.getActiveToolNames();
       skipTaieForTurn = skipTaie;
       if (skipTaie) session.setActiveToolsByName(activeTools.filter(name => name !== "taie_analyze" && name !== "taie_get_finding"));
@@ -210,7 +214,7 @@ export async function createTaieAgent(options: AgentOptions) {
         : "Host policy for this user task: Tai-e is enabled. Any skip policy from a previous task has expired. Use taie_analyze after meaningful Java changes; the host will independently run a fresh build/test/analysis check after your response.";
       const repairPolicy = repairMode === "auto"
         ? "Repair policy: auto. Repair supported defects while preserving the requested behavior."
-        : `Repair policy: ${repairMode}. You may implement the requested example or feature, but must preserve deliberately introduced defects. After finding build failures, failed tests or project analysis findings, explain them and stop; do not fix them, even if you think a fix is easy. The host ${repairMode === "ask" ? "will ask the human before starting a repair round" : "will not start automatic repairs"}. Never delete or weaken tests, suppress detectors or change build configuration to obtain a passing result.`;
+        : `Repair policy: ${repairMode}. You may implement the requested example or feature, but must preserve deliberately introduced defects. A pre-task baseline does not pause this requested work. After your taie_analyze call reports build failures, failed tests or project analysis findings, explain them and stop; do not fix them, even if you think a fix is easy. The host ${repairMode === "ask" ? "will ask the human before starting a repair round" : "will not start automatic repairs"}. Never delete or weaken tests, suppress detectors or change build configuration to obtain a passing result.`;
       const controller = new AbortController();
       currentTaskSignal = controller.signal;
       let timedOut = false;
@@ -230,8 +234,16 @@ export async function createTaieAgent(options: AgentOptions) {
         result = await verifyTask({
           task,
           skipTaie,
+          baselineEnabled: frozenConfig.baselineEnabled,
           maxRepairs: settings.maxRepairs,
           repairMode,
+          onBaseline(baseline) {
+            taskBaseline = baseline;
+            lastCheck = baseline.check;
+            log({ type: "task_baseline", baseline });
+            if (baseline.check) options.onStatus?.(`Baseline: ${baseline.status}; check=${baseline.check.status}; project findings=${baseline.check.findingCounts.project}; report: ${baseline.check.humanReportPath}`);
+            else options.onStatus?.(`Baseline: ${baseline.status}${baseline.error ? `; ${baseline.error}` : ""}`);
+          },
           async confirmRepair(report, round) {
             clearTimeout(timer);
             remainingMs -= Date.now() - activeSince;
@@ -250,7 +262,10 @@ export async function createTaieAgent(options: AgentOptions) {
             const backend = frozenConfig.buildBackend ?? 'javac';
             const coverage = backend === 'maven-docker' ? 'Source roots and classpath come from the Maven build; checks run offline in Docker.'
               : `Configured source roots: ${JSON.stringify(frozenConfig.sourceRoots)}. Project tests are not run by this backend.`;
-            await session.prompt(`${taskPolicy}\n${phasePolicy}\nBuild backend: ${backend}\n${coverage}\nConfigured analyses: ${(frozenConfig.analyses ?? ["dropped-exception", "clone-idiom", "dead-code"]).join(", ")}\n\n${text}`);
+            const baselineContext = taskBaseline?.check
+              ? `Before-task baseline: ${taskBaseline.status}; check=${taskBaseline.check.status}; build=${taskBaseline.check.stages.build}, tests=${taskBaseline.check.stages.test.status}, analysis=${taskBaseline.check.stages.analysis}; project findings=${taskBaseline.check.findingCounts.project}. Report: ${taskBaseline.check.reportPath}; readable: ${taskBaseline.check.humanReportPath}.`
+              : `Before-task baseline: ${taskBaseline?.status ?? "unavailable"}${taskBaseline?.error ? `; ${taskBaseline.error}` : ""}.`;
+            await session.prompt(`${taskPolicy}\n${phasePolicy}\nBuild backend: ${backend}\n${coverage}\nConfigured analyses: ${(frozenConfig.analyses ?? ["dropped-exception", "clone-idiom", "dead-code"]).join(", ")}\n${baselineContext}\nThe baseline records pre-existing state, not a repair authorization. Implement the requested task; do not independently fix unrelated baseline findings. A failed baseline does not prevent creating or updating the requested code, and does not establish that there were zero findings.\n\n${text}`);
             if (timedOut) throw new Error("Agent task timed out.");
             if (exceededTurns) throw new Error(`Agent exceeded ${settings.maxTurns} model turns.`);
             const assistant = [...session.messages].reverse().find(message => message.role === "assistant");
@@ -258,7 +273,7 @@ export async function createTaieAgent(options: AgentOptions) {
               throw new Error("errorMessage" in assistant ? String(assistant.errorMessage) : `Model stopped: ${assistant.stopReason}`);
             }
           },
-          analyze: () => analyze(controller.signal),
+          analyze: baseline => analyze(controller.signal, baseline),
           onCheck(report) {
             lastCheck = report;
             if (repairMode !== "auto") writeLocked = true;
@@ -269,6 +284,7 @@ export async function createTaieAgent(options: AgentOptions) {
       } finally {
         clearTimeout(timer);
         currentTaskSignal = undefined;
+        taskBaseline = undefined;
         skipTaieForTurn = false;
         writeLocked = false;
         running = false;
