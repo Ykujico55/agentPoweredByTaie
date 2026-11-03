@@ -17,7 +17,7 @@ interface Waiter {
   resolve: (line: string | undefined) => void;
 }
 
-export function createConsoleInput(input: Readable, output: Writable): ConsoleInput {
+export function createConsoleInput(input: Readable, output: Writable, onInterrupt?: () => boolean): ConsoleInput {
   const terminal = Boolean(
     (input as Readable & { isTTY?: boolean }).isTTY
     && (output as Writable & { isTTY?: boolean }).isTTY,
@@ -54,6 +54,11 @@ export function createConsoleInput(input: Readable, output: Writable): ConsoleIn
     drain();
   });
   reader.on("close", markClosed);
+  // Readline consumes terminal Ctrl+C; let the host cancel active work while
+  // retaining the input queue. Unhandled interrupts keep the usual close behavior.
+  reader.on("SIGINT", () => {
+    if (!onInterrupt?.()) reader.close();
+  });
   reader.on("error", () => {
     markClosed();
     reader.close();

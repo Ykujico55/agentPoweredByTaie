@@ -179,6 +179,8 @@ CLI 默认 `ask`；为兼容已有程序接口，直接调用 agent API 且省�
 
 ## 首步 Maven 容器检查
 
+本节保留告警分层修复前的运行记录；其中依赖告警影响顶层状态的行为已在后续修复，当前语义见下一节。
+
 验证日期：2026-11-03（Asia/Shanghai）。本步增加独立 `check-maven`，尚未接入聊天与模型工具。运行方式和边界见 [Maven 容器检查](maven-check.md)。未调用大模型，未修改 Tai-e 检测器。
 
 本机 Docker Linux 引擎 29.8.0 实际完成镜像构建及运行。容器使用 Maven 3.9.9、JDK 17.0.15、Node 22.19.0；实际镜像 ID 为 `sha256:d4d506626439f4a823686a3b958d029e02b3a3e15d31b5b793406746ebd3c101`。测试使用固定官方 Tai-e 0.5.4 和 `dropped-exception` 检测器。
@@ -213,3 +215,105 @@ CLI 默认 `ask`；为兼容已有程序接口，直接调用 agent API 且省�
 离线 `help:evaluate` 的插件前缀解析失败后，源码发现改为读取实际编译生成的 `inputFiles.lst`，见 [失败阶段报告](../.taie-agent/maven-smoke/2026-11-02T18-48-46-736Z/project/.taie-agent/maven-runs/2026-11-02T18-48-46-766Z-5b9fc21f/report.json)。带依赖的首个成功分析还暴露了 `APP` 包含非 JRE 库类的事实，因此保留依赖告警，并独立设置零告警对照，没有删除告警来令测试通过。
 
 以上耗时来自单次本机运行和已有依赖缓存，不是性能基准；最终实现尚未在全空 Maven 缓存下重新验收。注解处理专项、无测试和更多失败类型的容器端到端覆盖、隔离攻击探针、JDK 17 污点回归、聊天迁移与后续复核/补丁流程均仍待开发。本轮未重跑全量 `npm test` 或源码检测器原生套件。
+
+## Maven 项目与依赖告警分层
+
+本节保留 Linux 卷优化前的验证结果；后续提速和整轮回归进展见下一节。
+
+修复日期：2026-11-03（Asia/Shanghai）。此前虽然记录了 APP 包含非 JRE 依赖的 limitation，仍把全部告警计入 `findings` 状态，无法用于项目告警复核与指标统计。本次修正 Maven 报告，保留旧运行证据。
+
+顶层 Maven 协议升级为 `schemaVersion: 2`，状态范围为 `statusScope: "project"`。按真实编译输出类清单为告警添加 `origin`；`analysis.findings` 始终只含项目告警，`findingCounts` 分别统计项目、依赖及总数。默认隐藏依赖详情，`--include-dependencies` 将其单列显示；两个模式的项目状态及退出码一致。SARIF 记录 origin，复核模板保持项目与依赖列表分离。原始 APP 报告、传播证据和完整依赖告警文件保留。
+
+本次没有改 Tai-e 分析范围、classpath、检测器规则或项目代码来消除告警。归属按主报告位置决定；依赖告警没有被认定为误报。尚未迁移的聊天及独立 `analyze` 入口维持原有语义。
+
+- `npm run typecheck`：通过。
+- `npm run test:host`：**67/67 通过**。新增覆盖类产物归属、无源码映射与内部类、同名不同包、完整证据不变、JSON/SARIF/复核分层和 CLI 参数适用范围。
+- 镜像已重建；旧镜像缺少 `findingScope` 时无法被当作新的项目结果接受。
+
+对此前保留的真实 Maven 编译产物和 Tai-e 报告重新执行归属分类，得到正常依赖项目 `0 项目 / 24 依赖`、含吞异常项目 `1 项目 / 24 依赖`、JDK 对照 `0 / 0`；每例总数守恒、原始记录不变。证据：[历史报告归属核对](../.taie-agent/origin-replay/2026-11-03/result.json)。这是历史证据重放，不是新的整轮分析。
+
+本轮新增的六场景 `test:maven` 在首例触及原有 600 秒总时限，后五例未执行，**不得记为六例通过**。准备阶段成功，但 Maven 各阶段较此前明显变慢；例如插件准备 107.94 秒、离线 classpath 解析 119.54 秒。证据：[冒烟结果](../.taie-agent/maven-smoke/2026-11-03T02-06-27-856Z/result.json)。随后带 `--include-dependencies` 的真实 CLI 离线整轮仍超时，正确返回 `timeout` 和退出码 1，见 [CLI 结果](../.taie-agent/origin-cli/2026-11-03/result.json)。没有增加默认时限，也没有将超时当作无告警；耗时根因未确定，整轮回归仍待通过。
+
+为单独验证新 worker，另建工作副本，复用上述已成功准备的有效 POM 与依赖缓存，以原有 600 秒时限重新执行离线 `clean compile`、JUnit、默认三项 Tai-e 检测及分层。该阶段 **通过**，耗时 431.11 秒，worker 退出码 0：构建完成、1 个测试通过、分析完成，`findingScope: project`，计数为 **0 项目 / 71 依赖 / 71 总计**，默认没有 `dependencyFindings` 详情。证据：[独立离线阶段结果](../.taie-agent/origin-worker/2026-11-03T02-26-57-640Z/result.json)。这是新的真实分析，但不包含同一总时限内的依赖准备，因此不替代前述整轮回归。显式展示的 JSON/SARIF/复核分层由定向测试覆盖，真实 CLI 整轮成功仍待验证。
+
+## Linux 卷存储优化
+
+验证日期：2026-11-03（Asia/Shanghai）。将 Maven 缓存、输入及构建工作目录移到 Docker 的 Linux 卷，以批量导入/导出替代运行期间的 Windows bind mount 小文件访问。保持 Maven 调用次数、默认三检测器、JDK、依赖版本、2 CPU / 2 GiB 和 600 秒预算不变；本步没有缓存分析结果或删除依赖分析。
+
+- 类型检查通过；宿主测试 **70/70 通过**，新增 3 项存储导出测试，包括实际符号链接拒绝，未跳过。
+- 旧缓存约 64 MB，一次性复制到 `taie-maven-repository-v1-15e22985384c` 用时 43.87 秒；旧目录保留。该迁移和镜像构建不计入后续检查。证据：[迁移结果](../.taie-agent/volume-migration/2026-11-03T03-03-23-243Z/result.json)。
+- 首个完整检查返回 `passed`，包含准备、构建、JUnit、Tai-e、导入/导出和清理，共 **275.51 秒**；项目告警 0、依赖告警 71。
+
+同一示例的离线阶段单次对照：
+
+| 阶段 | Windows 挂载 | Linux 卷 |
+| --- | ---: | ---: |
+| Maven 编译 | 64.17 秒 | 22.14 秒 |
+| classpath | 131.93 秒 | 24.60 秒 |
+| Maven 测试 | 88.43 秒 | 27.77 秒 |
+| exporter 编译 | 24.59 秒 | 13.24 秒 |
+| Tai-e 进程 | 108.44 秒 | 58.14 秒 |
+| 整个离线 worker | **431.11 秒** | **153.54 秒** |
+
+离线阶段耗时减少 **64.39%**。前后源码指纹、分析器 SHA-256、三个依赖 JAR 哈希、检测器组合、分析实体数和全部 71 条依赖告警 ID 一致；导出后的依赖、classes 和报告文件实际存在。对照证据：[result.json](../.taie-agent/volume-performance/2026-11-03/result.json)。这是单机单次前后对照，不是统计性能基准；宿主负载可能不同，不能将旧版仅离线阶段耗时与新版整轮耗时混为同一口径。
+
+正常结束后删除本轮容器及临时卷，仅保留缓存卷。导出失败时保留工作卷并记录 `storage.recoveryVolume`，同时返回失败；半写 JSON 或不安全文件不能被默默丢弃后判为通过。阶段证据导出与清理在超时/取消后仍使用独立时限。
+
+另在依赖准备开始后主动取消：返回 `timeout`，部分 Maven 阶段日志成功导出，两个临时卷均经 Docker 查询确认不存在，未误删持久缓存；整次约 68.93 秒。证据：[取消结果](../.taie-agent/volume-cancel/2026-11-03T03-19-07-245Z/result.json)及同目录卷不存在检查日志。导出失败保留卷分支已做代码复查，未声称完成容器故障注入验收。
+
+`npm run test:maven` 的六个真实场景全部通过预期断言，均在原有 600 秒执行预算内完成。证据：[六场景结果](../.taie-agent/maven-smoke/2026-11-03T03-04-44-780Z/result.json)。
+
+| 场景 | 结果 | 项目 / 依赖告警 | 整轮耗时 |
+| --- | --- | --- | ---: |
+| 默认隐藏依赖详情 | `passed` | 0 / 71 | 275.51 秒 |
+| 显式展示依赖详情 | `passed` | 0 / 71 | 311.42 秒 |
+| JUnit 断言失败 | `test_failed` | 0 / 71 | 354.03 秒 |
+| Java 编译失败 | `build_failed` | 未运行分析 | 184.94 秒 |
+| 项目吞异常 | `findings` | 1 / 71 | 292.21 秒 |
+| JDK 实现对照 | `passed` | 0 / 0 | 269.95 秒 |
+
+最终 Docker 查询未发现本轮任务容器或临时工作/输入卷，仅保留专用 Maven 缓存卷。新导出/清理逻辑的类型检查也通过。本轮未请求模型，未重跑完整 `npm test` 或检测器原生套件；当前仍为分钟级检查，重复 Maven 调用和 exporter 编译尚未优化。
+
+## 聊天手动检查与统一阶段报告
+
+验证日期：2026-11-03（Asia/Shanghai）。新增手动 `/check`、后端/依赖联网/依赖展示三项交互配置，以及独立 `check.json`，保留原有后端报告。此步没有接入模型工具、自动自检或误报复核。
+
+- `npm run typecheck` 通过；`npm run test:host` **82/82 通过**。覆盖统一状态、项目/依赖分层、无凭据 CLI 检查、单轮覆盖保留、Maven 选择后禁止模型入口回退、切换项目重置联网设置、模拟终端 Ctrl+C 后继续输入。
+- 复查修正源码冻结回归后，类型检查以及配置/CLI 定向测试 **12/12 通过**。已冻结的 javac 源码范围不因改变检测器等配置重新推断，同时不作为 Maven 手工覆盖传入。
+- 从无模型凭据的真实 CLI 进程预输入 `/set build-backend maven-docker`、`/set dependency-network off`、`/analysis off`、`/check`、`/config`、`/exit`。离线 Maven 全链路 **117.87 秒**，返回 `passed`，构建和 1 个测试通过，分析完成，项目 0 / 依赖 71 条，默认不展开依赖详情，复核为 `not_run`。进程退出码 0，只产生 Maven 证据目录，没有模型会话或修复。证据：[运行记录](../.taie-agent/check-ui-validation/2026-11-03T04-18-14-319Z/result.json)、[统一报告](../.taie-agent/check-ui-validation/2026-11-03T04-18-14-319Z/project/.taie-agent/maven-runs/2026-11-03T04-18-14-707Z-c746caa2/check.json)；同目录保留 stdout/stderr。
+- javac 对干净示例执行真实 `/check`，**14.68 秒**完成编译和默认三项分析，项目/依赖均零告警；统一状态正确返回 `tests_not_run`，测试、复核均为 `not_run`，CLI 退出码 1。证据：[运行记录](../.taie-agent/check-ui-validation/javac-2026-11-03T04-20-51-478Z/result.json)、[统一报告](../.taie-agent/check-ui-validation/javac-2026-11-03T04-20-51-478Z/project/.taie-agent/runs/2026-11-03T04-20-51-827Z-5db8fc5b/check.json)。
+
+本轮使用已有镜像和离线缓存，没有改动容器 worker 或重跑六场景 Maven 套件；时间是本次单次验证记录，不作为新的性能对照。未调用模型 API，也未重跑原生检测器套件。旧 `verified` 的含义暂时不变；Maven 模型任务集成和状态迁移为下一小步。
+
+## 中文 Markdown 质检报告
+
+验证日期：2026-11-03（Asia/Shanghai）。聊天 `/check` 与独立 `check-maven` CLI 自动输出 `check.md`；统一 JSON 增加 `humanReportPath` 和检测器列表 `analyses`。生成器只读取本次检查数据，不调用模型、不重新执行分析，后端原始报告不变。
+
+- `npm run typecheck` 通过，`npm run test:host` **86/86 通过**。
+- 报告测试覆盖中文结论、测试计数、检测器、依赖详情开关、失败/超时/过期时的零记录含义、超过十条告警完整展示、特殊文件名链接和代码/日志中的 Markdown 分隔符。真实 CLI 子进程验证 `/check` 失败时仍输出 Markdown，并验证 `check-maven` 在 JDK 配置拒绝时保留原 stdout JSON、另存统一 JSON 和可读报告；这些测试不启动 Docker 或模型。
+- 复用已有四次真实 Maven 结果，分别生成 [项目零告警](../.taie-agent/readable-report-validation/dependency-findings/check.md)、[展开依赖](../.taie-agent/readable-report-validation/include-dependencies/check.md)、[测试失败](../.taie-agent/readable-report-validation/failed-test/check.md) 和 [项目有告警](../.taie-agent/readable-report-validation/findings/check.md) 的报告示例。已逐一检查共 13 个本地 JSON、源码、测试报告链接可达，并比对原始后端报告 SHA-256 未变。[生成验证记录](../.taie-agent/readable-report-validation/result.json) 保存路径、状态、计数和哈希。
+
+本轮仅验证报告生成与输出，不把历史检查称为新一次 Maven 运行，也未重跑检测器原生套件或模型端到端验证。
+
+## 模型工具与宿主验收接入统一检查
+
+验证日期：2026-11-03（Asia/Shanghai）。`taie_analyze`、任务结束后的宿主检查和 `/check` 现共用 `checkProject`。agent 结果升级为 `schemaVersion: 2`，只有新的构建、实际测试和分析均通过且项目零告警才返回 `verified`；javac 未运行测试的干净结果为 `incomplete`，失败统一为 `check_failed`。修复反馈区分项目与依赖告警，保留 `ask/auto/off` 与跳过检测。
+
+类型检查通过，宿主测试 **95/95 通过**。覆盖测试失败零告警、测试未运行、过期与基础设施失败、批准/拒绝/关闭修复、预算、跳过、模型查询默认项目范围、JSON/Markdown 报告和配置迁移。新增 CLI 鉴权测试首次在加载真实 Pi SDK 时超过原本用于本地命令的 20 秒时限；该用例单独改为 60 秒后通过，其他本地命令仍为 20 秒。纯告警查询测试移出 SDK 导入链，避免无关初始化。本步没有增加生产任务的默认时限。
+
+执行 `npm run test:live:maven`，使用真实 `deepseek/deepseek-v4-flash`、既有 Docker 镜像及离线缓存，在复制出的 `maven-simple` 上验证完整流程。测试程序仅在观察到真实 JUnit 失败、零项目静态告警且 POM/测试未改动后，批准一次修复；并非模型自行批准。
+
+| 顺序 | 发起方 | 状态 | 测试 | 项目 / 依赖告警 | 检查耗时 |
+| --- | --- | --- | --- | --- | ---: |
+| 1 | 模型 `taie_analyze` | `test_failed` | 1 个，失败 1 个 | 0 / 0 | 136.04 秒 |
+| 2 | 宿主独立检查 | `test_failed` | 1 个，失败 1 个 | 0 / 0 | 120.28 秒 |
+| 3 | 批准修复后的模型工具 | `passed` | 1 个通过 | 0 / 71 | 148.40 秒 |
+| 4 | 最终宿主独立检查 | `passed` | 1 个通过 | 0 / 71 | 135.37 秒 |
+
+整轮从 06:41:00 至 06:50:19 UTC，约 **559.41 秒（9 分 19 秒）**，结果 `verified`，宿主检查 2 次、批准修复 1 轮。错误实现返回固定 `BROKEN_GREETING`；修复恢复 Commons Lang 问候逻辑。模型确实调用了 `edit`、`taie_analyze` 和 `taie_get_finding`，不是只生成一段建议文字。
+
+验证还确认：原 POM 和测试文件哈希未改变；失败报告字节未被修复覆盖；失败和成功快照指纹不同；模型工具报告与宿主报告属于不同运行；JSON 与 Markdown 文件均存在；最终 71 条依赖告警未触发项目失败或额外修复。
+
+证据：[运行记录](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/result.json)、[批准前的失败质检报告](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/project/.taie-agent/maven-runs/2026-11-03T06-43-29-079Z-0afbfcd9/check.md)、[最终质检报告](../.taie-agent/live-maven/2026-11-03T06-41-00-205Z-43f68278/project/.taie-agent/maven-runs/2026-11-03T06-48-04-189Z-36a97ff2/check.md)。同目录保留提示、修复前后 Java 文件、模型事件及各阶段后端日志。
+
+原有 javac live 脚本已适配 `incomplete/tests_not_run` 和新报告结构，本轮仅做类型检查，未重新执行它们或原生检测器套件。当前仍执行模型检查与新鲜宿主检查，不复用前者；Maven 构建、测试和分析在容器执行，模型 shell/文件工具仍使用宿主权限。只读误报复核与隔离候选补丁尚未实现。

@@ -157,3 +157,30 @@ test('structured files preserve raw evidence and keep every finding unreviewed i
     await rm(runDir, { recursive: true, force: true });
   }
 });
+
+test('project reports gate dependency details and keep review lists separate', async () => {
+  const root = path.resolve('.taie-agent', 'reporting-tests');
+  await mkdir(root, { recursive: true });
+  const dependency = finding({ id: 'dependency-id', origin: 'dependency', className: 'lib.Helper', sourcePath: undefined });
+  const project = finding({ id: 'project-id', origin: 'project' });
+  for (const include of [false, true]) {
+    const runDir = await mkdtemp(path.join(root, 'origin-'));
+    try {
+      const analysis = report([project], { runDir, findingScope: 'project',
+        findingCounts: { project: 1, dependency: 1, total: 2 },
+        ...(include ? { dependencyFindings: [dependency] } : {}) });
+      await writeStructuredOutputs(analysis);
+      const sarif = JSON.parse(await readFile(analysis.evidence.sarif, 'utf8'));
+      const triage = JSON.parse(await readFile(analysis.evidence.triage, 'utf8'));
+      assert.deepEqual(sarif.runs[0].results.map((item: any) => item.properties.origin),
+        include ? ['project', 'dependency'] : ['project']);
+      assert.deepEqual(triage.findings.map((item: any) => item.findingId), ['project-id']);
+      assert.equal(triage.findings[0].origin, 'project');
+      assert.equal(triage.findingCounts.dependency, 1);
+      assert.deepEqual(triage.dependencyFindings?.map((item: any) => item.origin), include ? ['dependency'] : undefined);
+    } finally {
+      assert.equal(path.dirname(runDir), root);
+      await rm(runDir, { recursive: true, force: true });
+    }
+  }
+});

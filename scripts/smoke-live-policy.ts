@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createTaieAgent, redactSecrets } from "../src/agent.ts";
-import type { AnalysisReport } from "../src/taie.ts";
+import type { CheckResult } from "../src/check.ts";
 import { getJavaExecutables } from "../src/taie.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -104,7 +104,10 @@ async function main() {
         record.repairRounds = report.repairRounds;
         record.repairDecisions = report.repairDecisions;
         record.sourceAfter = await sourceSnapshot();
-        for (const check of report.checks) assert.equal(check.taiE.sha256, manifest.sha256);
+        for (const check of report.checks) {
+          const backend = JSON.parse(await readFile(check.backendReportPath, "utf8"));
+          assert.equal(backend.taiE.sha256, manifest.sha256);
+        }
         return report;
       } finally {
         const log = await existingLog(sharedEventsPath);
@@ -140,7 +143,7 @@ async function main() {
       "No repair has been approved. Preserve the existing code.",
     ].join("\n"), () => activeAgent.configure({
       repairMode: "ask", config: expandedConfig,
-      confirmRepair: async (report: AnalysisReport, round: number) => {
+      confirmRepair: async (report: CheckResult, round: number) => {
         deniedQuestions++;
         confirmations.push({ phase: "02-ask-denied", round, approved: false,
           reportPath: report.reportPath, analyses: [...report.analyses] });
@@ -170,7 +173,7 @@ async function main() {
       "After an approved edit, invoke taie_analyze to check the code. Do not suppress detectors, delete functionality or change analysis configuration.",
     ].join("\n"), () => activeAgent.configure({
       repairMode: "ask", config: expandedConfig,
-      confirmRepair: async (report: AnalysisReport, round: number) => {
+      confirmRepair: async (report: CheckResult, round: number) => {
         approvedQuestions++;
         confirmations.push({ phase: "03-ask-approved", round, approved: true,
           reportPath: report.reportPath, analyses: [...report.analyses] });
@@ -178,11 +181,13 @@ async function main() {
       },
     }));
     assert.equal(approvedQuestions, 1, "Only one approved repair round is expected.");
-    assert.equal(approved.outcome, "verified", approved.error);
+    assert.equal(approved.schemaVersion, 2);
+    assert.equal(approved.outcome, "incomplete", approved.error);
     assert.equal(approved.repairRounds, 1);
     assert.deepEqual(approved.repairDecisions, [{ round: 1, approved: true }]);
     assert.ok(approved.checks[0]?.findings.some(finding => finding.type === "INTEGER_DIVIDE_BY_ZERO"));
-    assert.equal(approved.checks.at(-1)?.status, "completed");
+    assert.equal(approved.checks.at(-1)?.status, "tests_not_run");
+    assert.equal(approved.checks.at(-1)?.stages.analysis, "completed");
     assert.equal(approved.checks.at(-1)?.findings.length, 0);
     assert.ok(approved.toolCalls.some(name => name === "write" || name === "edit"));
     const approvedEvents = (await readFile(phases["03-ask-approved"].eventsPath as string, "utf8"))

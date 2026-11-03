@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { CheckResult } from '../src/check.ts';
+import type { VerificationResult } from '../src/verification.ts';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const smokeId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`;
@@ -32,9 +34,10 @@ interface AnalysisCheck {
 }
 
 interface AgentRun {
-  outcome: 'verified' | 'unresolved' | 'analysis_error' | 'agent_error';
+  schemaVersion: 2;
+  outcome: VerificationResult['outcome'];
   runDir: string;
-  checks: AnalysisCheck[];
+  checks: CheckResult[];
   toolCalls: string[];
   model: unknown;
   finalText: string;
@@ -100,10 +103,10 @@ function runBounded(executable: string, args: string[], timeoutMs: number): Prom
   });
 }
 
-function requireSuccess(result: CommandResult, label: string): void {
+function requireSuccess(result: CommandResult, label: string, expectedExitCode = 0): void {
   assert.equal(result.spawnError, undefined, `${label} could not start: ${result.spawnError}`);
   assert.equal(result.timedOut, false, `${label} exceeded its time limit`);
-  assert.equal(result.exitCode, 0, `${label} exited ${result.exitCode}: ${result.stderr.slice(-3000)}`);
+  assert.equal(result.exitCode, expectedExitCode, `${label} exited ${result.exitCode}: ${result.stderr.slice(-3000)}`);
 }
 
 function javaExecutable(name: 'java' | 'javac'): string {
@@ -151,21 +154,23 @@ async function runSeededRepair(evidence: SmokeEvidence, timeoutMs: number, save:
   await save();
   console.log(`Live smoke seeded repair: ${repairDir}`);
   seeded.commands.agent = await runBounded(process.execPath, [
-    'src/cli.ts', 'run', '--project', repairDir, '--prompt-file', promptFile, '--max-repairs', '2',
+    'src/cli.ts', 'run', '--project', repairDir, '--prompt-file', promptFile, '--max-repairs', '2', '--repair-mode', 'auto',
   ], timeoutMs);
   await save();
-  requireSuccess(seeded.commands.agent, 'Seeded repair agent');
+  requireSuccess(seeded.commands.agent, 'Seeded repair agent (javac tests_not_run)', 1);
   seeded.agentRun = JSON.parse(await readFile(path.join(repairDir, '.taie-agent', 'last-agent-run.json'), 'utf8')) as AgentRun;
   const run = seeded.agentRun;
-  assert.equal(run.outcome, 'verified', `Seeded repair outcome was ${run.outcome}`);
+  assert.equal(run.schemaVersion, 2);
+  assert.equal(run.outcome, 'incomplete', `Seeded repair outcome was ${run.outcome}`);
   assert.ok(run.toolCalls.includes('taie_analyze'), 'Seeded repair model did not call taie_analyze');
-  const completedChecks = run.checks.filter((check) => check.status === 'completed');
+  const completedChecks = run.checks.filter((check) => check.stages.analysis === 'completed');
   assert.ok(completedChecks.length > 0, 'Seeded repair recorded no completed host analysis');
   assert.deepEqual(completedChecks.at(-1)?.findings, [], 'Final seeded repair host check still reported findings');
+  assert.equal(completedChecks.at(-1)?.status, 'tests_not_run');
   for (const check of completedChecks) await readFile(check.reportPath, 'utf8');
   const events = (await readFile(path.join(run.runDir, 'events.jsonl'), 'utf8')).trim().split(/\r?\n/)
-    .filter(Boolean).map((line) => JSON.parse(line) as { type: string; report?: AnalysisCheck });
-  assert.ok(events.some((event) => event.type === 'taie_tool_report' && event.report?.status === 'completed'
+    .filter(Boolean).map((line) => JSON.parse(line) as { type: string; report?: CheckResult });
+  assert.ok(events.some((event) => event.type === 'taie_tool_report' && event.report?.stages.analysis === 'completed'
     && event.report.sourceFingerprint === seeded.baseline?.sourceFingerprint && hasDroppedException(event.report)),
   'No real model-invoked Tai-e report observed the unchanged seeded defect before repair');
   seeded.assertions.push('The model called Tai-e on the original source and received the actual dropped-exception finding');
@@ -226,18 +231,21 @@ async function main(): Promise<void> {
     assert.ok(process.env.DEEPSEEK_API_KEY, 'DEEPSEEK_API_KEY is required for the live smoke test');
     evidence.commands.agent = await runBounded(process.execPath, [
       'src/cli.ts', 'run', '--project', projectDir,
-      '--prompt-file', promptFile, '--max-repairs', '2',
+      '--prompt-file', promptFile, '--max-repairs', '2', '--repair-mode', 'auto',
     ], configuredTimeout);
     await save();
-    requireSuccess(evidence.commands.agent, 'Coding agent');
+    requireSuccess(evidence.commands.agent, 'Coding agent (javac tests_not_run)', 1);
     evidence.agentRun = JSON.parse(await readFile(path.join(projectDir, '.taie-agent', 'last-agent-run.json'), 'utf8')) as AgentRun;
     const run = evidence.agentRun;
-    assert.equal(run.outcome, 'verified', `Agent outcome was ${run.outcome}`);
-    evidence.assertions.push('Host verification completed with outcome=verified');
+    assert.equal(run.schemaVersion, 2);
+    assert.equal(run.outcome, 'incomplete', `Agent outcome was ${run.outcome}`);
+    assert.equal(run.checks.at(-1)?.status, 'tests_not_run');
+    assert.deepEqual(run.checks.at(-1)?.findings, []);
+    evidence.assertions.push('Host compilation and analysis succeeded; outcome=incomplete accurately records that javac runs no project tests');
     assert.ok(Array.isArray(run.toolCalls) && run.toolCalls.includes('taie_analyze'), 'Model did not call taie_analyze');
     evidence.assertions.push('Actual model tool calls include taie_analyze');
     assert.ok(Array.isArray(run.checks) && run.checks.length > 0, 'Host recorded no analysis checks');
-    const completedChecks = run.checks.filter((check) => check.status === 'completed');
+    const completedChecks = run.checks.filter((check) => check.stages.analysis === 'completed');
     assert.ok(completedChecks.length > 0, 'Host recorded no completed analysis check');
     for (const check of completedChecks) {
       assert.ok(typeof check.reportPath === 'string' && check.reportPath.length > 0, 'Completed check omitted reportPath');

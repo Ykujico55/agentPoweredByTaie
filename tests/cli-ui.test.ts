@@ -30,7 +30,7 @@ async function workspace(run: (directory: string) => Promise<void>): Promise<voi
   }
 }
 
-function runCli(args: string[], lines: string[], directory: string): Promise<CliResult> {
+function runCli(args: string[], lines: string[], directory: string, timeoutMs = 20_000): Promise<CliResult> {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     if (/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(key)) delete env[key];
@@ -51,7 +51,7 @@ function runCli(args: string[], lines: string[], directory: string): Promise<Cli
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (text: string) => { stdout += text; });
     child.stderr.on('data', (text: string) => { stderr += text; });
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 20_000);
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
     child.once('error', error => { clearTimeout(timer); reject(error); });
     child.once('close', exitCode => { clearTimeout(timer); resolve({ exitCode, stdout, stderr, timedOut }); });
     child.stdin.on('error', error => { if ((error as NodeJS.ErrnoException).code !== 'EPIPE') reject(error); });
@@ -189,17 +189,121 @@ test('--help documents configurable settings, launch flags, and local chat comma
     const result = await runCli(['--help'], [], directory);
     assert.equal(result.timedOut, false);
     assert.equal(result.exitCode, 0, result.stderr);
-    for (const flag of ['project', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+    for (const flag of ['project', 'build-backend', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
       'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
-      'taint-implicit-entries', 'java-version', 'jar', 'json', 'prompt', 'prompt-file', 'skip-taie', 'no-repair', 'help']) {
+      'taint-implicit-entries', 'java-version', 'jar', 'json', 'prompt', 'prompt-file', 'skip-taie', 'no-repair', 'help',
+      'dependency-network', 'include-dependencies']) {
       assert.match(result.stdout, new RegExp(`^\\s+--${flag}(?=\\s|$)`, 'm'), flag);
     }
-    for (const command of ['/config', '/settings', '/set', '/repair', '/analysis', '/help', '/exit']) {
+    for (const command of ['/config', '/settings', '/set', '/repair', '/analysis', '/check', '/help', '/exit']) {
       assert.ok(result.stdout.includes(command), command);
     }
     assert.match(result.stdout, /repair-mode=ask/);
     assert.match(result.stdout, /first message only/);
     assert.doesNotMatch(result.stdout, /host checks:|Tool:|\bverified;/);
     assert.deepEqual(await readdir(directory), []);
+  });
+});
+
+test('--include-dependencies is rejected outside run/chat/check-maven before starting work', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    for (const command of ['analyze', 'doctor']) {
+      const result = await runCli([command, '--project', directory, '--include-dependencies'], [], directory);
+      assertLocal(result, 1);
+      assert.match(result.stderr, /--include-dependencies applies only to run\/chat or check-maven/);
+      await assertOnlyConfig(directory);
+    }
+  });
+});
+
+test('chat check runs without credentials, keeps overrides, and returns stage evidence in JSON', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    const project = path.join(directory, 'manual check');
+    const result = await runCli(['chat', '--project', project, '--json', '--jar', path.join(directory, 'missing.jar'),
+      '--include-dependencies', '--dependency-network', 'off'], [
+      '/analysis off', '/repair auto', '--skip-taie', '/check', '/config', '/exit',
+    ], directory);
+    assert.equal(result.timedOut, false, result.stderr);
+    assert.equal(result.exitCode, 1, result.stderr);
+    const check = JSON.parse(result.stdout);
+    assert.equal(check.backend, 'javac');
+    assert.equal(check.status, 'analysis_failed');
+    assert.equal(check.stages.build, 'not_run');
+    assert.equal(check.stages.test.status, 'not_run');
+    assert.equal(check.stages.review, 'not_run');
+    assert.match(result.stderr, /下一条任务覆盖：跳过检测/);
+    assert.doesNotMatch(result.stderr, /Tool:|Host check:|\[修复选择\]|No credentials/);
+    assert.deepEqual(await readdir(path.join(project, '.taie-agent')), ['runs']);
+    assert.deepEqual(JSON.parse(await readFile(check.reportPath, 'utf8')), check);
+    const readable = await readFile(check.humanReportPath, 'utf8');
+    assert.match(readable, /analysis_failed/);
+    assert.ok(result.stderr.includes(check.humanReportPath));
+    assert.equal(JSON.parse(await readFile(check.backendReportPath, 'utf8')).schemaVersion, 2);
+  });
+});
+
+test('Maven selection reaches model authentication without starting a check or falling back to javac', { timeout: 90_000 }, async () => {
+  await workspace(async directory => {
+    const project = path.join(directory, 'maven selected');
+    const result = await runCli(['chat', '--project', project, '--build-backend', 'maven-docker'], [
+      'Write a Java class', '/config', '/set build-backend javac', '/config', '/exit',
+    ], directory, 60_000); // This case loads the real Pi SDK; local-only commands retain their 20s bound.
+    assertLocal(result, 1);
+    assert.match(result.stderr, /No credentials for deepseek/);
+    assert.doesNotMatch(result.stderr, /maven-docker 当前仅支持 \/check/);
+    assert.equal(panels(result.stderr)[0]['build-backend'], 'maven-docker');
+    assert.equal(panels(result.stderr).at(-1)!['build-backend'], 'javac');
+    assert.deepEqual(await readdir(path.join(project, '.taie-agent')), ['agent-runs']);
+  });
+});
+
+test('run accepts Maven settings and still validates the task before creating a model session', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    const result = await runCli(['run', '--project', directory, '--build-backend', 'maven-docker',
+      '--dependency-network', 'off', '--include-dependencies'], [], directory);
+    assertLocal(result, 1);
+    assert.match(result.stderr, /run requires --prompt/);
+    await assertOnlyConfig(directory);
+  });
+});
+
+test('check-maven writes a readable failure report while preserving its original JSON output', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    // An unsupported JDK target fails before Docker access, so this is a host-only check.
+    const result = await runCli(['check-maven', '--project', directory, '--java-version', '8'], [], directory);
+    assert.equal(result.timedOut, false, result.stderr);
+    assert.equal(result.exitCode, 1);
+    const backend = JSON.parse(result.stdout);
+    assert.equal(backend.schemaVersion, 2);
+    assert.equal(backend.status, 'error');
+    assert.deepEqual(JSON.parse(await readFile(backend.reportPath, 'utf8')), backend);
+    const check = JSON.parse(await readFile(path.join(backend.runDir, 'check.json'), 'utf8'));
+    assert.equal(check.status, 'error');
+    assert.equal(check.stages.build, 'not_run');
+    assert.ok(result.stderr.includes(check.humanReportPath));
+    assert.match(await readFile(check.humanReportPath, 'utf8'), /JDK 17/);
+    assert.deepEqual((await readdir(backend.runDir)).sort(), ['check.json', 'check.md', 'report.json']);
+  });
+});
+
+test('project switching loads build settings without carrying network permission to another project', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    const original = path.join(directory, 'maven');
+    const target = path.join(directory, 'default');
+    await mkdir(original);
+    const originalConfig = JSON.stringify({ buildBackend: 'maven-docker', dependencyNetwork: true, includeDependencies: true });
+    await writeFile(path.join(original, 'taie-agent.json'), originalConfig);
+    const result = await runCli(['chat', '--project', original], [
+      `/set project "${target}"`, '/config', '/exit',
+    ], directory);
+    assertLocal(result);
+    const displayed = panels(result.stderr);
+    assert.equal(displayed[0]['build-backend'], 'maven-docker');
+    assert.equal(displayed[0]['dependency-network'], 'on');
+    assert.equal(displayed.at(-1)!['build-backend'], 'javac');
+    assert.equal(displayed.at(-1)!['dependency-network'], 'off');
+    assert.equal(displayed.at(-1)!['include-dependencies'], 'off');
+    await assertOnlyConfig(original, originalConfig);
+    await assertOnlyConfig(target);
   });
 });

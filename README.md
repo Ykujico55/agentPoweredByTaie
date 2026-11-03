@@ -1,12 +1,16 @@
 # Tai-e Coding Agent
 
-基于 **Pi SDK + Tai-e** 的 Java coding agent 原型。模型可以读写代码、执行命令、调用 `taie_analyze`；宿主程序在模型完成后独立执行一次新的编译和分析。CLI 默认采用 `repair-mode=ask`，发现告警或编译错误后，先询问用户，再决定是否交回模型修复。讨论或其他无需检查的任务可以显式跳过本轮 Tai-e。
+基于 **Pi SDK + Tai-e** 的 Java coding agent 原型。模型可以读写代码、执行命令、调用 `taie_analyze`；宿主在模型完成后独立执行一次新的质检。Maven 后端包含真实构建、项目测试与分析。CLI 默认采用 `repair-mode=ask`，发现项目告警、构建或测试错误后，先询问用户，再决定是否交回模型修复。讨论或其他无需检查的任务可以显式跳过本轮 Tai-e。
 
 当前阶段验证工程闭环，尚未进行模型或框架的比较实验。
 
 后续产品范围与实施顺序已确认，见 [产品规格](docs/product-spec.md) 和 [开发与验收计划](docs/development-plan.md)。两份文档区分已确认目标与当前实现；第一阶段聚焦 JDK 17、单模块 Maven 和隔离执行。
 
-第一步新增独立的 `check-maven`：在项目快照和 JDK 17 容器中运行真实 Maven 构建、单元测试及 Tai-e。使用 `npm run build:maven-image` 构建镜像，运行方式与范围见 [Maven 容器检查](docs/maven-check.md)。聊天任务的构建与工具执行尚未迁移到这个后端。
+独立 `check-maven`、聊天 `/check`、模型工具和任务自动验收已共用质检接口。选择 `maven-docker` 后，在项目快照和 JDK 17 容器中运行真实 Maven 构建、单元测试及 Tai-e。使用 `npm run build:maven-image` 构建镜像，运行方式与范围见 [Maven 容器检查](docs/maven-check.md)。
+
+`check-maven` 的状态只计入项目告警，默认隐藏依赖告警详情；`--include-dependencies` 可查看单列的依赖告警，开关不改变项目状态。完整 APP 分析证据始终保留，报告记录两类计数与 `origin`。
+
+Maven 缓存与构建工作目录使用 Docker 管理的 Linux 卷，检查后导出可在宿主查看的证据并清理临时卷。升级后需重新构建镜像；首次可用 `--dependency-network on` 填充缓存。性能对照和六场景回归见 [验证记录](docs/validation.md)。
 
 已加入源码扩展：修复临时 `null` 常量导致的分析异常，新增整数/long 除零检测，接入带跨方法传播证据的污点分析插件。完整用法见 [扩展功能说明](docs/extensions.md)。
 
@@ -41,7 +45,17 @@ npm start -- chat --project examples/playground
 
 ## 在聊天中配置和修复
 
-启动 `chat` 会显示完整的 18 项设置面板，包括 CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改；`/help` 显示完整 CLI 帮助。
+启动 `chat` 会显示完整的 21 项设置面板，包括 CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改；`/help` 显示完整 CLI 帮助。
+
+手动 `/check` 无需模型、不会修复，输出构建/测试/分析/复核阶段及项目/依赖告警。用 `/set build-backend maven-docker` 为模型工具、宿主验收和手动检查选择 Maven，`/set dependency-network on` 显式允许依赖准备联网。javac 未运行测试，干净检查状态为 `tests_not_run`，模型任务最终结果为 `incomplete`。完整说明见 [交互配置](docs/interactive-settings.md)。
+
+```powershell
+npm start -- chat --project tests/fixtures/maven-simple --build-backend maven-docker --dependency-network off
+```
+
+以上命令使用已有依赖缓存；首次准备可显式设为 `on`，检查阶段仍离线。模型编写代码后调用 `taie_analyze`，宿主随后独立复查。Maven 不可用时保留错误，不自动回退到宿主 javac。
+
+`/check` 和 `check-maven` CLI 每次都会同时生成中文 **`check.md` 质检报告**，包含结论、各阶段结果、告警详情和证据链接；命令行会显示其路径，现有 JSON 结果继续保留。
 
 ```text
 /config
@@ -122,35 +136,36 @@ npm run analyze -- --project examples/clean
 
 `classpath` 示例须替换为存在的依赖或留空。相对路径以目标项目为基准。`mainClass` 可选；`javaVersion` 可设置 `javac --release`，分析的运行库仍来自运行 Tai-e 的 JDK。通过 `TAIE_JAVA_HOME` 或 `JAVA_HOME` 选择 JDK，通过 `TAIE_JAR` 或 `--jar` 指定其他 Tai-e JAR。
 
-现有 `run`、`chat` 和 `analyze` 面向可由 `javac` 编译的普通 Java 项目，也支持 Maven/Gradle 常见源码目录；**不会自动解析依赖或运行这些构建系统的测试生命周期**。这些入口的第三方依赖需在 `classpath` 中提供。真实单模块 Maven 检查使用新增的 `check-maven`。Spring/Android 等框架的入口和运行语义尚未专门建模。
+`run`、`chat` 默认仍使用 `javac`，需手工提供 classpath，且不运行项目测试；可用 `--build-backend maven-docker` 接入真实单模块 Maven 生命周期。独立 `analyze` 保留原 javac 协议和行为。Gradle 构建以及 Spring/Android 等框架入口和运行语义尚未专门建模。
 
 ## 自动复查如何运行
 
 以下是启用 Tai-e 时的流程；跳过的任务只执行模型任务并记录结果，下一条任务按照会话检测默认值运行。
 
 1. Pi 根据任务调用读写、编辑和 shell 工具，真正生成或修改代码。
-2. 模型可主动调用 `taie_analyze`，获得新的编译结果、结构化告警和证据文件。
-3. 模型停止后，宿主独立重新编译和分析；单个任务内源码范围和分析配置固定，可在用户任务之间通过配置命令更新。污点规则在该配置首次分析时读取为快照。
-4. 有告警或编译错误时，`ask` 每轮先征得同意，`auto` 自动将证据交回模型，`off` 保留结果；最多追加两轮修复，可用 `--max-repairs` 调整。
+2. 模型可主动调用 `taie_analyze`，通过所选后端取得构建、测试、分析结果和中文质检报告。
+3. 模型停止后，宿主独立重新质检；javac 源码范围和分析配置保持冻结，Maven 每次从新快照的真实构建取得产物。污点规则在该配置首次分析时读取为快照。
+4. 有项目告警或可修复的构建/测试错误时，`ask` 每轮先征得同意，`auto` 自动将证据交回模型，`off` 保留结果；最多追加两轮修复，可用 `--max-repairs` 调整。单纯缺少测试或分析器/环境故障不会触发盲目修复。
 5. 返回机器可读的结果，不以模型自行声称“已通过”为准。
 
-结果中的 `outcome`：
+agent 结果协议为 `schemaVersion: 2`，`checks` 使用统一阶段报告。结果中的 `outcome`：
 
 | 值 | 含义 |
 | --- | --- |
-| `verified` | 最后一次新的编译成功，所配置检测器分析完成且没有告警 |
+| `verified` | 最后一次新的构建、实际项目测试、分析均通过，且无项目告警 |
 | `skipped` | 按本轮选项或会话默认值跳过 Tai-e，模型任务正常完成；没有执行宿主检查或修复循环 |
 | `unresolved` | 仍有告警，包括关闭修复、拒绝修复或修复预算用完的情况 |
-| `analysis_error` | 编译错误未解决，或分析未能完成 |
+| `incomplete` | 未运行项目测试；例如 javac 编译与分析成功且无项目告警 |
+| `check_failed` | 构建或测试失败未解决，或分析/后端失败、超时、输入过期 |
 | `agent_error` | 模型请求失败、任务超时或超过模型轮数预算 |
 
-`verified` 不表示功能测试通过或所有 bug 已排除。宿主当前不自动判定和删除误报；未解决告警会保留。默认任务超时 10 分钟，模型轮数上限 30，可通过 `--timeout` 和 `--max-turns` 调整。
+`verified` 表示已配置的构建、项目测试和分析通过，不证明所有 bug 已排除，误报复核仍为 `not_run`。旧 `analysis_error` 已统一为 `check_failed`；旧 javac 干净任务现在返回 `incomplete`，退出码 1。默认任务超时 10 分钟，模型轮数上限 30，可通过 `--timeout` 和 `--max-turns` 调整。
 
 `run` / `chat` 对 `verified` 和 `skipped` 返回退出码 `0`，其他结果返回 `1`。需要确认静态检查通过时，应检查 `outcome === "verified"`，不能只看进程退出码。
 
 每个项目的 `.taie-agent/` 保存编译与分析证据、模型完成消息和工具调用，以及 `last-agent-run.json`。每次分析输出 schema v2 的 `report.json`、SARIF 2.1.0 的 `results.sarif` 和独立的 `triage.json`；exporter 成功运行后还会生成 `findings.raw.json`。agent 可通过 `taie_get_finding` 按 ID 获取局部证据。每次分析使用新的输出目录，避免旧 `.class` 文件导致结果过期。通过 `--json` 仅输出最终 JSON。
 
-现有 `run`、`chat` 的 Pi shell 和文件工具使用启动进程的操作系统权限，尚无独立沙箱。新增的 `check-maven` 只隔离其构建、测试和分析链路。请在专用项目目录运行。
+`run`、`chat` 的 Pi shell 和文件工具使用启动进程的操作系统权限，尚无独立沙箱。`maven-docker` 只隔离构建、测试和分析链路。请在专用项目目录运行。
 
 ## 验证
 
@@ -158,9 +173,12 @@ npm run analyze -- --project examples/clean
 npm run typecheck
 npm test
 npm run test:live
+npm run test:live:maven
 ```
 
 普通测试不请求模型，包含真实 `javac`/Tai-e 集成检查和宿主复查逻辑测试。`test:live` 使用环境中的 API key 请求模型，会产生正常 API 用量；脚本检查实际写入的 Java 文件、`taie_analyze` 工具调用、宿主分析证据，并独立编译和执行 Java 断言。证据保存在本仓库 `.taie-agent/live-smoke/`。
+
+`test:live:maven` 使用离线 Maven 缓存与真实模型，验证“模型写入错误实现 → 测试失败但项目零静态告警 → 确认修复 → 模型修复 → 新的宿主检查通过”；测试同时确认 POM 和既有测试未被修改。javac 系列 live 脚本保留独立运行断言，但不把独立断言结果伪装成 agent 已执行的项目测试。
 
 ## 代码入口
 

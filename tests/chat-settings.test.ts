@@ -13,7 +13,7 @@ function settings(): ChatSettings {
 }
 
 test('the settings registry covers every configurable CLI setting exactly once', () => {
-  const keys = ['project', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+  const keys = ['project', 'build-backend', 'dependency-network', 'include-dependencies', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
     'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
     'taint-implicit-entries', 'java-version', 'jar', 'json'];
   assert.deepEqual(CHAT_SETTING_REGISTRY.map(entry => entry.key), keys);
@@ -42,6 +42,9 @@ test('applying a setting returns a detached object and preserves unrelated analy
 
 test('scalar settings accept valid choices and integer boundaries while rejecting invalid values', () => {
   const cases: [string, string, (result: ChatSettings) => unknown, unknown][] = [
+    ['build-backend', 'maven-docker', result => result.config.buildBackend, 'maven-docker'],
+    ['dependency-network', 'on', result => result.config.dependencyNetwork, true],
+    ['include-dependencies', 'off', result => result.config.includeDependencies, false],
     ['provider', 'another-provider', result => result.provider, 'another-provider'],
     ['model', '"new-model"', result => result.model, 'new-model'],
     ['repair-mode', 'auto', result => result.repairMode, 'auto'],
@@ -57,6 +60,7 @@ test('scalar settings accept valid choices and integer boundaries while rejectin
   ];
   for (const [key, value, read, expected] of cases) assert.deepEqual(read(applySetting(settings(), key, value)), expected, key);
   for (const [key, values] of [
+    ['build-backend', ['gradle', 'host']], ['dependency-network', ['yes']], ['include-dependencies', ['1']],
     ['max-repairs', ['-1', 'NaN', '1.5', '1e3', '0xff', '9007199254740992']],
     ['max-turns', ['0', '-1']], ['timeout', ['0', 'Infinity']], ['analysis-timeout', ['0']],
     ['java-version', ['7', '17.0']], ['repair-mode', ['yes']], ['analysis', ['yes']],
@@ -97,7 +101,27 @@ test('interactive project paths resolve against the current project and optional
   for (const [key, field] of [['jar', 'jarPath'], ['main-class', 'mainClass'], ['taint-config', 'taintConfig'], ['java-version', 'javaVersion']] as const)
     assert.equal(applySetting(configured, key, 'unset').config[field], undefined);
   assert.equal(applySetting(configured, 'source-root', 'auto').config.sourceRoots, undefined);
+  configured.config.classpath = ['lib/a.jar'];
+  assert.equal(applySetting(configured, 'classpath', 'auto').config.classpath, undefined);
+  assert.deepEqual(configured.config.classpath, ['lib/a.jar']);
   assert.deepEqual(configured.config.sourceRoots, ['old']);
+});
+
+test('the Maven panel uses build metadata defaults and explains the manual check scope', () => {
+  const current = settings();
+  const values = (state: ChatSettings) => Object.fromEntries(CHAT_SETTING_REGISTRY.map(entry => [entry.key, entry.display(state)]));
+  assert.equal(values(current)['build-backend'], 'javac');
+  assert.equal(values(current)['dependency-network'], 'off');
+  assert.equal(values(current)['include-dependencies'], 'off');
+  const maven = applySetting(current, 'build-backend', 'maven-docker');
+  assert.equal(values(maven)['source-root'], 'auto → Maven 构建结果');
+  assert.equal(values(maven).classpath, 'auto → Maven 构建结果');
+  assert.equal(values(maven)['analysis-timeout'], '600000');
+  assert.equal(values(maven)['java-version'], 'unset（容器 JDK 17）');
+  assert.match(renderSettings(maven), /\/check 按 build-backend 执行检查，不调用模型或自动修复/);
+  assert.match(renderSettings(maven), /模型工具、宿主验收和 \/check 使用同一后端/);
+  assert.match(renderSettings(maven), /干净结果为 incomplete/);
+  assert.equal(values(applySetting(maven, 'analysis-timeout', '4321'))['analysis-timeout'], '4321');
 });
 
 test('the panel renders effective defaults, resolved directories and safe read-only environment state', async () => {
@@ -139,6 +163,7 @@ test('chat command parsing preserves task text and JSON arguments and maps alias
   assert.deepEqual(parseChatCommand(' /config '), { kind: 'settings' });
   assert.deepEqual(parseChatCommand('/settings'), { kind: 'settings' });
   assert.deepEqual(parseChatCommand('/help'), { kind: 'help' });
+  assert.deepEqual(parseChatCommand(' /check '), { kind: 'check' });
   assert.deepEqual(parseChatCommand('/exit'), { kind: 'exit' });
   assert.deepEqual(parseChatCommand('/set --model another-model'), { kind: 'set', key: 'model', value: 'another-model' });
   assert.deepEqual(parseChatCommand('/set classpath ["D:/Java libs/a,b.jar", "lib/c.jar"]'), {
@@ -149,7 +174,7 @@ test('chat command parsing preserves task text and JSON arguments and maps alias
   assert.deepEqual(parseChatCommand('/analysis off'), { kind: 'set', key: 'analysis', value: 'off' });
   assert.deepEqual(parseChatCommand('  Write Java code.  '), { kind: 'message', text: '  Write Java code.  ' });
   assert.deepEqual(parseChatCommand('--skip-taie 先讨论设计'), { kind: 'message', text: '--skip-taie 先讨论设计' });
-  for (const input of ['/unknown', '/set', '/set model', '/set unknown value', '/repair', '/repair yes', '/analysis', '/analysis maybe', '/config extra', '/exit now'])
+  for (const input of ['/unknown', '/set', '/set model', '/set unknown value', '/repair', '/repair yes', '/analysis', '/analysis maybe', '/config extra', '/check extra', '/exit now'])
     assert.throws(() => parseChatCommand(input), Error, input);
 });
 

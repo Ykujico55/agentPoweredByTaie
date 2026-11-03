@@ -98,6 +98,16 @@ const definition = (key: string, description: string, usage: string,
 export const CHAT_SETTING_REGISTRY: readonly ChatSettingDefinition[] = [
   definition('project', '目标项目目录', '<目录>', settings => JSON.stringify(resolve(settings.projectDir)),
     (settings, raw) => { settings.projectDir = resolve(settings.projectDir, scalar(raw)); }),
+  definition('build-backend', '模型工具、宿主验收与 /check 的构建后端', 'javac|maven-docker', settings => settings.config.buildBackend ?? 'javac',
+    (settings, raw) => {
+      const value = scalar(raw).toLowerCase();
+      if (value !== 'javac' && value !== 'maven-docker') throw new Error('构建后端必须使用 javac 或 maven-docker。');
+      settings.config.buildBackend = value;
+    }),
+  definition('dependency-network', 'Maven 依赖准备阶段联网；检查阶段始终离线', 'on|off', settings => settings.config.dependencyNetwork ? 'on' : 'off',
+    (settings, raw) => { settings.config.dependencyNetwork = boolean(raw); }),
+  definition('include-dependencies', '展示依赖告警详情；不影响项目状态或修复门槛', 'on|off', settings => settings.config.includeDependencies ? 'on' : 'off',
+    (settings, raw) => { settings.config.includeDependencies = boolean(raw); }),
   definition('provider', '模型供应商', '<id>', settings => settings.provider,
     (settings, raw) => { settings.provider = identifier(raw); }),
   definition('model', '模型名称', '<id>', settings => settings.model,
@@ -112,7 +122,8 @@ export const CHAT_SETTING_REGISTRY: readonly ChatSettingDefinition[] = [
     (settings, raw) => { settings.maxTurns = integer(raw, 1); }),
   definition('timeout', '整个任务的时限（毫秒）', '<毫秒 >= 1>', settings => String(settings.timeoutMs),
     (settings, raw) => { settings.timeoutMs = integer(raw, 1); }),
-  definition('analysis-timeout', '单次编译和分析时限（毫秒）', '<毫秒 >= 1>', settings => String(settings.config.timeoutMs ?? 120_000),
+  definition('analysis-timeout', '单次检查时限（毫秒；Maven 包含准备、构建、测试和分析）', '<毫秒 >= 1>',
+    settings => String(settings.config.timeoutMs ?? (settings.config.buildBackend === 'maven-docker' ? 600_000 : 120_000)),
     (settings, raw) => { settings.config.timeoutMs = integer(raw, 1); }),
   definition('analyses', 'Tai-e 检测器组合', '<JSON 数组或 csv>', settings => JSON.stringify(settings.config.analyses ?? DEFAULT_ANALYSES),
     (settings, raw) => {
@@ -123,6 +134,7 @@ export const CHAT_SETTING_REGISTRY: readonly ChatSettingDefinition[] = [
     }),
   definition('source-root', 'Java 源码根目录', '<JSON 数组或 csv>|auto', settings => {
     if (settings.config.sourceRoots) return paths(settings.config.sourceRoots, settings.projectDir);
+    if (settings.config.buildBackend === 'maven-docker') return 'auto → Maven 构建结果';
     const inferred = existsSync(resolve(settings.projectDir, 'src/main/java')) ? 'src/main/java'
       : existsSync(resolve(settings.projectDir, 'src')) ? 'src' : '.';
     return `auto → ${paths([inferred], settings.projectDir)}`;
@@ -130,16 +142,22 @@ export const CHAT_SETTING_REGISTRY: readonly ChatSettingDefinition[] = [
     if (raw.trim().toLowerCase() === 'auto') delete settings.config.sourceRoots;
     else settings.config.sourceRoots = array(raw);
   }),
-  definition('classpath', '依赖 JAR 或目录；[] 清空', '<JSON 数组或 csv>', settings => paths(settings.config.classpath ?? [], settings.projectDir),
-    (settings, raw) => { settings.config.classpath = array(raw, true); }),
+  definition('classpath', '依赖 JAR 或目录；[] 清空；auto 清除显式覆盖', '<JSON 数组或 csv>|auto',
+    settings => settings.config.classpath === undefined && settings.config.buildBackend === 'maven-docker'
+      ? 'auto → Maven 构建结果' : paths(settings.config.classpath ?? [], settings.projectDir),
+    (settings, raw) => {
+      if (raw.trim().toLowerCase() === 'auto') delete settings.config.classpath;
+      else settings.config.classpath = array(raw, true);
+    }),
   definition('main-class', 'Java 入口类；unset 清除', '<类名>|unset', settings => settings.config.mainClass ?? 'unset',
     (settings, raw) => { if (unset(raw)) delete settings.config.mainClass; else settings.config.mainClass = identifier(raw); }),
   definition('taint-config', '污点策略文件；unset 清除', '<文件>|unset', settings => optionalPath(settings.config.taintConfig, settings.projectDir),
     (settings, raw) => { if (unset(raw)) delete settings.config.taintConfig; else settings.config.taintConfig = resolve(settings.projectDir, scalar(raw)); }),
   definition('taint-implicit-entries', '是否建模 JVM 隐式入口', 'on|off', settings => (settings.config.taintImplicitEntries ?? true) ? 'on' : 'off',
     (settings, raw) => { settings.config.taintImplicitEntries = boolean(raw); }),
-  definition('java-version', 'javac --release；unset 使用所选 JDK 默认值', '<整数 >= 8>|unset',
-    settings => settings.config.javaVersion === undefined ? 'unset（所选 JDK 默认目标）' : String(settings.config.javaVersion),
+  definition('java-version', 'javac --release；Maven 后端固定 JDK 17，仅接受 17 或 unset', '<整数 >= 8>|unset',
+    settings => settings.config.javaVersion === undefined
+      ? (settings.config.buildBackend === 'maven-docker' ? 'unset（容器 JDK 17）' : 'unset（所选 JDK 默认目标）') : String(settings.config.javaVersion),
     (settings, raw) => { if (unset(raw)) delete settings.config.javaVersion; else settings.config.javaVersion = integer(raw, 8); }),
   definition('jar', 'Tai-e JAR；unset 恢复环境变量或官方默认', '<文件>|unset', settings => {
     if (settings.config.jarPath) return JSON.stringify(resolve(settings.projectDir, settings.config.jarPath));
@@ -175,11 +193,19 @@ export function renderSettings(current: ChatSettings): string {
     '',
     '相对路径：project 相对当前项目目录；jar、taint-config、source-root、classpath 相对所选项目。',
     'source-root auto 清除显式目录，下一轮重新推断。改变设置是否重建会话由 CLI 提示。',
+    'Maven 从构建结果取得 source-root 和 classpath，不接受手动覆盖；可将二者设为 auto。',
+    '/check 按 build-backend 执行检查，不调用模型或自动修复；/analysis off 不会禁用显式 /check。',
+    '模型工具、宿主验收和 /check 使用同一后端；Maven 后端不可用时不回退到宿主 javac。',
+    'verified 要求构建、实际测试、分析通过且无项目告警；javac 未运行测试，干净结果为 incomplete。',
+    'Maven 构建/测试/分析在容器中执行；模型的 shell 和文件工具仍在宿主执行。',
     '含逗号或空格的多个路径请使用 JSON 数组，Windows 路径可用 / 或 JSON 双反斜杠。',
     `Java 环境（只读）：${javaHome ? `${process.env.TAIE_JAVA_HOME ? 'TAIE_JAVA_HOME' : 'JAVA_HOME'}=${javaHome}` : 'PATH 中的 java / javac'}`,
     '',
     '用法：',
     '  /set model deepseek-v4-flash',
+    '  /set build-backend maven-docker',
+    '  /set dependency-network on',
+    '  /check',
     '  /set source-root ["src/main/java", "generated sources"]',
     '  /set classpath ["lib/dependency,one.jar", "D:/Java libraries/two.jar"]',
     '  /set jar vendor/Tai-e/build/tai-e-all-0.5.4.jar',
@@ -192,6 +218,7 @@ export function renderSettings(current: ChatSettings): string {
 
 export type ChatCommand =
   | { kind: 'settings' }
+  | { kind: 'check' }
   | { kind: 'set'; key: string; value: string }
   | { kind: 'help' }
   | { kind: 'exit' }
@@ -205,9 +232,9 @@ export function parseChatCommand(text: string): ChatCommand {
   if (!match) throw new Error('无效命令。输入 /help 查看用法。');
   const command = match[1];
   const argumentsText = match[2]?.trim() ?? '';
-  if (['/config', '/settings', '/help', '/exit'].includes(command)) {
+  if (['/config', '/settings', '/check', '/help', '/exit'].includes(command)) {
     if (argumentsText) throw new Error(`${command} 不接受参数。`);
-    return { kind: command === '/config' || command === '/settings' ? 'settings' : command === '/help' ? 'help' : 'exit' };
+    return { kind: command === '/config' || command === '/settings' ? 'settings' : command === '/check' ? 'check' : command === '/help' ? 'help' : 'exit' };
   }
   if (command === '/set') {
     const parameters = /^(\S+)\s+([\s\S]+)$/.exec(argumentsText);

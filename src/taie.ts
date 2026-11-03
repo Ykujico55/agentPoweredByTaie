@@ -33,6 +33,8 @@ export interface EvidenceLocation {
 }
 export interface Finding {
   id: string;
+  /** Ownership of the primary reported class, when classified by the build integration. */
+  origin?: 'project' | 'dependency';
   analysis: string;
   type: string;
   severity?: string | number;
@@ -79,6 +81,10 @@ export interface AnalysisReport {
   status: 'completed' | 'compile_failed' | 'analysis_failed' | 'timeout';
   projectDir: string;
   findings: Finding[];
+  /** Maven's project view; raw APP findings remain in the evidence report. */
+  findingScope?: 'project';
+  findingCounts?: { project: number; dependency: number; total: number };
+  dependencyFindings?: Finding[];
   reportPath: string;
   runDir: string;
   diagnostics: string[];

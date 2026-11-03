@@ -9,6 +9,8 @@ COPY --from=node /opt/runner /opt/runner
 COPY src /opt/runner/src
 COPY java-adapter /opt/runner/java-adapter
 COPY containers/maven/worker.ts /opt/runner/containers/maven/worker.ts
+COPY containers/maven/storage.ts /opt/runner/containers/maven/storage.ts
+RUN mkdir -p /workspace/project /input /maven-repository && chown -R 1000:1000 /workspace /input /maven-repository
 ENV HOME=/tmp MAVEN_CONFIG=/tmp/.m2
 WORKDIR /workspace/project
 USER 1000:1000

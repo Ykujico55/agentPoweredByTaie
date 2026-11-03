@@ -126,7 +126,7 @@ function flowLocations(finding: Finding, projectDir: string): SarifLocation[] {
 
 /** Convert only observed findings; an unsuccessful invocation is never represented as a clean pass. */
 export function toSarif(report: AnalysisReport) {
-  const findings = report.findings;
+  const findings = [...report.findings, ...(report.dependencyFindings ?? [])];
   const ruleIds = [...new Set(findings.map(finding => finding.ruleId ?? `${finding.analysis}/${finding.type}`))].sort();
   const rules = ruleIds.map(id => {
     const finding = findings.find(item => (item.ruleId ?? `${item.analysis}/${item.type}`) === id)!;
@@ -176,12 +176,14 @@ export function toSarif(report: AnalysisReport) {
             threadFlows: [{ locations: flow.map((point, index) => ({ location: point, executionOrder: index + 1 })) }],
           }] } : {}),
           properties: { findingId: finding.id, analysis: finding.analysis, type: finding.type,
+            ...(finding.origin ? { origin: finding.origin } : {}),
             ...(finding.confidence ? { confidence: finding.confidence } : {}),
             ...(finding.evidence ? { evidence: finding.evidence } : {}),
           },
         };
       }),
       properties: { schemaVersion: report.schemaVersion, status: report.status, runId: report.runId,
+        ...(report.findingScope ? { findingScope: report.findingScope, findingCounts: report.findingCounts } : {}),
         sourceFingerprint: report.sourceFingerprint, analyses: report.analyses,
         limitations: report.limitations, taiE: report.taiE, analysisMetadata: report.analysisMetadata },
     }],
@@ -192,9 +194,15 @@ export function toSarif(report: AnalysisReport) {
 export async function writeStructuredOutputs(report: AnalysisReport): Promise<void> {
   const sarif = path.join(report.runDir, 'results.sarif');
   const triage = path.join(report.runDir, 'triage.json');
+  const reviewEntry = (finding: Finding) => ({
+    findingId: finding.id, ruleId: finding.ruleId ?? `${finding.analysis}/${finding.type}`,
+    ...(finding.origin ? { origin: finding.origin } : {}),
+    state: 'unreviewed', rationale: '', evidence: [] as string[],
+  });
   const template = {
     schemaVersion: 2, runId: report.runId, reportPath: report.reportPath,
     analysisStatus: report.status, sourceFingerprint: report.sourceFingerprint,
+    ...(report.findingScope ? { findingScope: report.findingScope, findingCounts: report.findingCounts } : {}),
     states: {
       unreviewed: 'No review decision has been recorded.',
       confirmed: 'Evidence supports a real defect.',
@@ -202,10 +210,8 @@ export async function writeStructuredOutputs(report: AnalysisReport): Promise<vo
       unresolved: 'Available evidence does not establish a decision.',
     },
     instructions: 'Record review decisions and supporting evidence here. This file does not suppress or delete raw findings.',
-    findings: report.findings.map(finding => ({
-      findingId: finding.id, ruleId: finding.ruleId ?? `${finding.analysis}/${finding.type}`,
-      state: 'unreviewed', rationale: '', evidence: [] as string[],
-    })),
+    findings: report.findings.map(reviewEntry),
+    ...(report.dependencyFindings ? { dependencyFindings: report.dependencyFindings.map(reviewEntry) } : {}),
   };
   await writeFile(sarif, `${JSON.stringify(toSarif(report), null, 2)}\n`, { flag: 'wx' });
   await writeFile(triage, `${JSON.stringify(template, null, 2)}\n`, { flag: 'wx' });

@@ -92,3 +92,40 @@ test("queued readers are released in order when input arrives or closes", { time
   assert.deepEqual(await Promise.all([first, second, last]), ["a", "b", undefined]);
   consoleInput.close();
 });
+
+test("terminal Ctrl+C cancels active work without closing the following chat prompt", { timeout: 2_000 }, async () => {
+  const { input, output } = streams();
+  Object.assign(input, { isTTY: true });
+  Object.assign(output, { isTTY: true });
+  const controller = new AbortController();
+  let active = true;
+  const consoleInput = createConsoleInput(input, output, () => {
+    if (!active) return false;
+    controller.abort();
+    return true;
+  });
+  try {
+    input.write("\x03");
+    await nextTick();
+    assert.equal(controller.signal.aborted, true);
+    active = false;
+    const next = consoleInput.nextTask("task> ");
+    input.write("/config\n");
+    assert.equal(await next, "/config");
+    const pending = consoleInput.nextTask("task> ");
+    input.write("\x03");
+    assert.equal(await pending, undefined);
+  } finally { consoleInput.close(); }
+});
+
+test("terminal Ctrl+C without an interrupt handler closes the input", { timeout: 2_000 }, async () => {
+  const { input, output } = streams();
+  Object.assign(input, { isTTY: true });
+  Object.assign(output, { isTTY: true });
+  const consoleInput = createConsoleInput(input, output);
+  try {
+    const pending = consoleInput.nextTask("task> ");
+    input.write("\x03");
+    assert.equal(await pending, undefined);
+  } finally { consoleInput.close(); }
+});

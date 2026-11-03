@@ -1,13 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { verifyTask } from "../src/verification.ts";
-import type { AnalysisReport } from "../src/taie.ts";
+import { formatReport, isCheckPassed, isRepairableCheck, verifyTask } from "../src/verification.ts";
+import type { CheckResult } from "../src/check.ts";
 
-function report(status: AnalysisReport["status"], hasFinding = false): AnalysisReport {
+function report(status: CheckResult["status"], hasFinding = false): CheckResult {
   return {
-    status, projectDir: "/test-project", reportPath: "/test-project/report.json",
-    findings: hasFinding ? [{ type: "TEST_DEFECT", message: "Test defect evidence" }] : [],
-  } as AnalysisReport;
+    schemaVersion: 1, backend: "maven-docker", statusScope: "project",
+    status: status === "passed" && hasFinding ? "findings" : status,
+    projectDir: "/test-project", runDir: "/test-project/run", reportPath: "/test-project/check.json",
+    humanReportPath: "/test-project/check.md", backendReportPath: "/test-project/report.json", backendStatus: status,
+    analyses: ["dead-code"], diagnostics: [], limitations: [],
+    stages: {
+      build: status === "build_failed" ? "failed" : "passed",
+      test: { status: status === "test_failed" ? "failed" : status === "build_failed" || status === "tests_not_run" ? "not_run" : "passed",
+        tests: status === "tests_not_run" || status === "build_failed" ? 0 : 1,
+        failures: status === "test_failed" ? 1 : 0, errors: 0, skipped: 0, reportFiles: ["/test-project/TEST-example.xml"] },
+      analysis: status === "build_failed" ? "not_run" : status === "analysis_failed" ? "failed" : "completed",
+      review: "not_run",
+    },
+    findings: hasFinding ? [{ id: "project-finding", origin: "project", analysis: "dead-code", type: "TEST_DEFECT", message: "Test defect evidence" }] : [],
+    findingCounts: { project: hasFinding ? 1 : 0, dependency: 0, total: hasFinding ? 1 : 0 },
+  };
 }
 
 test("the host analyzes after the model finishes without calling any tools", async () => {
@@ -15,7 +28,7 @@ test("the host analyzes after the model finishes without calling any tools", asy
   const result = await verifyTask({
     task: "Write code", maxRepairs: 2,
     prompt: async () => { order.push("model stopped"); },
-    analyze: async () => { order.push("host analysis"); return report("completed"); },
+    analyze: async () => { order.push("host analysis"); return report("passed"); },
   });
   assert.deepEqual(order, ["model stopped", "host analysis"]);
   assert.equal(result.outcome, "verified");
@@ -27,7 +40,7 @@ test("findings are sent back with evidence and the repaired code receives a fres
   const result = await verifyTask({
     task: "Fix code", maxRepairs: 2,
     prompt: async text => { prompts.push(text); },
-    analyze: async () => report("completed", scans++ === 0),
+    analyze: async () => report("passed", scans++ === 0),
   });
   assert.equal(result.outcome, "verified");
   assert.equal(result.repairRounds, 1);
@@ -45,14 +58,14 @@ test("a failed analyzer with no findings is never accepted as verified", async (
     prompt: async () => { prompts++; },
     analyze: async () => report("analysis_failed"),
   });
-  assert.equal(result.outcome, "analysis_error");
+  assert.equal(result.outcome, "check_failed");
   assert.equal(prompts, 1);
 });
 
 test("unresolved warnings survive exhaustion of the repair budget", async () => {
   const result = await verifyTask({
     task: "Fix code", maxRepairs: 1,
-    prompt: async () => {}, analyze: async () => report("completed", true),
+    prompt: async () => {}, analyze: async () => report("passed", true),
   });
   assert.equal(result.outcome, "unresolved");
   assert.equal(result.checks.length, 2);
@@ -63,7 +76,7 @@ test("compilation errors can be repaired but provider errors cannot produce a cl
   let scans = 0;
   const repaired = await verifyTask({
     task: "Write code", maxRepairs: 1, prompt: async () => {},
-    analyze: async () => report(scans++ === 0 ? "compile_failed" : "completed"),
+    analyze: async () => report(scans++ === 0 ? "build_failed" : "passed"),
   });
   assert.equal(repaired.outcome, "verified");
   const failed = await verifyTask({
@@ -87,18 +100,18 @@ test("skipping Tai-e runs the task once without analysis, check callbacks, or re
     onCheck: () => { assert.fail("Skipped verification must not report a host check"); },
   });
   assert.deepEqual(prompts, ["Write code without Tai-e this round"]);
-  assert.deepEqual(result, { outcome: "skipped", checks: [], repairRounds: 0 });
+  assert.deepEqual(result, { schemaVersion: 2, outcome: "skipped", checks: [], repairRounds: 0 });
   assert.notEqual(result.outcome, "verified");
 });
 
 test("a skipped task does not disable normal verification and repair for the next task", async () => {
   const prompts: string[] = [];
-  const checked: AnalysisReport[] = [];
+  const checked: CheckResult[] = [];
   let scans = 0;
   const callbacks = {
     prompt: async (text: string) => { prompts.push(text); },
-    analyze: async () => report("completed", scans++ === 0),
-    onCheck: (value: AnalysisReport) => { checked.push(value); },
+    analyze: async () => report("passed", scans++ === 0),
+    onCheck: (value: CheckResult) => { checked.push(value); },
   };
   const skipped = await verifyTask({ ...callbacks, task: "Skip this task", maxRepairs: 2, skipTaie: true });
   assert.equal(skipped.outcome, "skipped");
@@ -133,9 +146,9 @@ test("skipping Tai-e does not hide provider failures", async () => {
 });
 
 test("ask mode obtains approval for each warning or compilation repair before prompting again", async () => {
-  const reports = [report("completed", true), report("compile_failed"), report("completed")];
+  const reports = [report("passed", true), report("build_failed"), report("passed")];
   const prompts: string[] = [];
-  const confirmations: { report: AnalysisReport; nextRound: number }[] = [];
+  const confirmations: { report: CheckResult; nextRound: number }[] = [];
   const events: string[] = [];
   let scans = 0;
   const result = await verifyTask({
@@ -156,12 +169,12 @@ test("ask mode obtains approval for each warning or compilation repair before pr
   assert.deepEqual(events, ["prompt", "analyze", "check", "confirm 1", "prompt", "analyze", "check", "confirm 2", "prompt", "analyze", "check"]);
   assert.equal(prompts[0], "Implement feature");
   assert.match(prompts[1], /TEST_DEFECT/);
-  assert.match(prompts[2], /compile_failed/);
+  assert.match(prompts[2], /build_failed/);
 });
 
 test("declining a repair preserves unresolved warnings and compilation failures without another prompt", async () => {
-  for (const status of ["completed", "compile_failed"] as const) {
-    const original = report(status, status === "completed");
+  for (const status of ["passed", "build_failed"] as const) {
+    const original = report(status, status === "passed");
     let prompts = 0;
     let confirmations = 0;
     const result = await verifyTask({
@@ -175,7 +188,7 @@ test("declining a repair preserves unresolved warnings and compilation failures 
         return false;
       },
     });
-    assert.equal(result.outcome, status === "completed" ? "unresolved" : "analysis_error");
+    assert.equal(result.outcome, status === "passed" ? "unresolved" : "check_failed");
     assert.deepEqual(result.checks, [original]);
     assert.equal(result.repairRounds, 0);
     assert.equal(prompts, 1);
@@ -184,15 +197,15 @@ test("declining a repair preserves unresolved warnings and compilation failures 
 });
 
 test("ask mode without a confirmation callback leaves the report unresolved", async () => {
-  for (const status of ["completed", "compile_failed"] as const) {
+  for (const status of ["passed", "build_failed"] as const) {
     let prompts = 0;
     let scans = 0;
     const result = await verifyTask({
       task: "Write code", maxRepairs: 2, repairMode: "ask",
       prompt: async () => { prompts++; },
-      analyze: async () => { scans++; return report(status, status === "completed"); },
+      analyze: async () => { scans++; return report(status, status === "passed"); },
     });
-    assert.equal(result.outcome, status === "completed" ? "unresolved" : "analysis_error");
+    assert.equal(result.outcome, status === "passed" ? "unresolved" : "check_failed");
     assert.equal(result.repairRounds, 0);
     assert.equal(result.checks.length, 1);
     assert.equal(prompts, 1);
@@ -201,11 +214,11 @@ test("ask mode without a confirmation callback leaves the report unresolved", as
 });
 
 test("off mode still analyzes and preserves evidence but never repairs or asks", async () => {
-  for (const status of ["completed", "compile_failed"] as const) {
-    const original = report(status, status === "completed");
+  for (const status of ["passed", "build_failed"] as const) {
+    const original = report(status, status === "passed");
     let prompts = 0;
     let scans = 0;
-    let checked: AnalysisReport | undefined;
+    let checked: CheckResult | undefined;
     const result = await verifyTask({
       task: "Write code", maxRepairs: 5, repairMode: "off",
       prompt: async () => { prompts++; },
@@ -213,7 +226,7 @@ test("off mode still analyzes and preserves evidence but never repairs or asks",
       onCheck: value => { checked = value; },
       confirmRepair: async () => { assert.fail("off mode must not request confirmation"); },
     });
-    assert.equal(result.outcome, status === "completed" ? "unresolved" : "analysis_error");
+    assert.equal(result.outcome, status === "passed" ? "unresolved" : "check_failed");
     assert.deepEqual(result.checks, [original]);
     assert.equal(checked, original);
     assert.equal(result.repairRounds, 0);
@@ -228,7 +241,7 @@ test("explicit auto mode repairs without consulting the confirmation callback", 
   const result = await verifyTask({
     task: "Write code", maxRepairs: 1, repairMode: "auto",
     prompt: async () => { prompts++; },
-    analyze: async () => report("completed", scans++ === 0),
+    analyze: async () => report("passed", scans++ === 0),
     confirmRepair: async () => { assert.fail("auto mode must not request confirmation"); },
   });
   assert.equal(result.outcome, "verified");
@@ -243,7 +256,7 @@ test("an exhausted repair budget never asks permission for another round", async
   const result = await verifyTask({
     task: "Fix code", maxRepairs: 1, repairMode: "ask",
     prompt: async () => { prompts++; },
-    analyze: async () => report("completed", true),
+    analyze: async () => report("passed", true),
     confirmRepair: async (_value, nextRound) => { rounds.push(nextRound); return true; },
   });
   assert.equal(result.outcome, "unresolved");
@@ -255,15 +268,15 @@ test("an exhausted repair budget never asks permission for another round", async
   const zeroBudget = await verifyTask({
     task: "Write code", maxRepairs: 0, repairMode: "ask",
     prompt: async () => {},
-    analyze: async () => report("compile_failed"),
+    analyze: async () => report("build_failed"),
     confirmRepair: async () => { assert.fail("A zero repair budget must not request confirmation"); },
   });
-  assert.equal(zeroBudget.outcome, "analysis_error");
+  assert.equal(zeroBudget.outcome, "check_failed");
   assert.equal(zeroBudget.repairRounds, 0);
 });
 
 test("a failed confirmation returns agent_error and retains the check without spending a repair round", async () => {
-  const original = report("completed", true);
+  const original = report("passed", true);
   let prompts = 0;
   const result = await verifyTask({
     task: "Write code", maxRepairs: 2, repairMode: "ask",
@@ -276,4 +289,137 @@ test("a failed confirmation returns agent_error and retains the check without sp
   assert.deepEqual(result.checks, [original]);
   assert.equal(result.repairRounds, 0);
   assert.equal(prompts, 1);
+});
+
+test("failed Maven tests with zero findings require approval and a fresh passing check", async () => {
+  const failed = report("test_failed");
+  const preserved = await verifyTask({ task: "Write code", maxRepairs: 1, repairMode: "off",
+    prompt: async () => {}, analyze: async () => failed });
+  assert.equal(preserved.outcome, "check_failed");
+  assert.equal(preserved.schemaVersion, 2);
+  assert.equal(preserved.repairRounds, 0);
+  assert.deepEqual(preserved.checks[0].findings, []);
+
+  const prompts: string[] = [];
+  let scans = 0;
+  let decisions = 0;
+  const repaired = await verifyTask({ task: "Write code", maxRepairs: 1, repairMode: "ask",
+    prompt: async text => { prompts.push(text); },
+    analyze: async () => scans++ === 0 ? failed : report("passed"),
+    confirmRepair: async (value, round) => {
+      assert.equal(value, failed);
+      assert.equal(round, 1);
+      decisions++;
+      return true;
+    },
+  });
+  assert.equal(repaired.outcome, "verified");
+  assert.equal(repaired.repairRounds, 1);
+  assert.equal(scans, 2);
+  assert.equal(decisions, 1);
+  assert.match(prompts[1], /test_failed/);
+  assert.match(prompts[1], /TEST-example\.xml/);
+  assert.match(prompts[1], /modify\/delete\/skip existing tests/);
+});
+
+test("javac without tests is incomplete and missing tests alone never start a repair loop", async () => {
+  const clean = report("tests_not_run");
+  clean.backend = "javac";
+  for (const repairMode of ["auto", "ask", "off"] as const) {
+    let prompts = 0;
+    const result = await verifyTask({ task: "Write code", maxRepairs: 3, repairMode,
+      prompt: async () => { prompts++; }, analyze: async () => clean,
+      confirmRepair: async () => { assert.fail("Missing tests are not an automatic code repair"); },
+    });
+    assert.equal(result.outcome, "incomplete");
+    assert.equal(result.repairRounds, 0);
+    assert.equal(prompts, 1);
+  }
+  const buggy = report("tests_not_run", true);
+  buggy.backend = "javac";
+  assert.equal(isRepairableCheck(buggy), true);
+  let scans = 0;
+  const result = await verifyTask({ task: "Fix code", maxRepairs: 3,
+    prompt: async () => {}, analyze: async () => scans++ === 0 ? buggy : clean });
+  assert.equal(result.outcome, "incomplete");
+  assert.equal(result.repairRounds, 1);
+  assert.equal(scans, 2);
+  assert.equal(result.checks.at(-1)?.findings.length, 0);
+});
+
+test("passed requires actual tests, completed stages and no project findings even if a status is inconsistent", async () => {
+  const cases: ((value: CheckResult) => void)[] = [
+    value => { value.stages.build = "failed"; },
+    value => { value.stages.test.status = "failed"; },
+    value => { value.stages.test.status = "not_run"; },
+    value => { value.stages.test.tests = 0; },
+    value => { value.stages.test.skipped = value.stages.test.tests; },
+    value => { value.stages.test.failures = 1; },
+    value => { value.stages.test.errors = 1; },
+    value => { value.stages.analysis = "failed"; },
+    value => { value.findingCounts.project = 1; },
+    value => { value.findings = report("findings", true).findings; },
+  ];
+  for (const change of cases) {
+    const inconsistent = report("passed");
+    change(inconsistent);
+    assert.equal(isCheckPassed(inconsistent), false);
+    const result = await verifyTask({ task: "Write code", maxRepairs: 1, repairMode: "ask",
+      prompt: async () => {}, analyze: async () => inconsistent,
+      confirmRepair: async () => { assert.fail("An inconsistent result must not authorize code repair"); },
+    });
+    assert.equal(result.outcome, "check_failed");
+  }
+});
+
+test("stale input and infrastructure failures never trigger code repair even with partial findings", async () => {
+  for (const status of ["stale", "timeout", "unsupported", "error", "analysis_failed"] as const) {
+    const partial = report(status, true);
+    assert.equal(isCheckPassed(partial), false);
+    assert.equal(isRepairableCheck(partial), false);
+    let prompts = 0;
+    const result = await verifyTask({ task: "Write code", maxRepairs: 2, repairMode: "ask",
+      prompt: async () => { prompts++; }, analyze: async () => partial,
+      confirmRepair: async () => { assert.fail("Infrastructure errors must not authorize code repair"); },
+    });
+    assert.equal(result.outcome, "check_failed");
+    assert.equal(prompts, 1);
+    assert.equal(result.repairRounds, 0);
+  }
+  const preparationFailed = report("build_failed");
+  preparationFailed.stages.build = "not_run";
+  assert.equal(isRepairableCheck(preparationFailed), false, "dependency preparation failure is not a compilation defect");
+  const crashed = await verifyTask({ task: "Write code", maxRepairs: 1, prompt: async () => {},
+    analyze: async () => { throw new Error("backend unavailable"); } });
+  assert.equal(crashed.outcome, "check_failed");
+  assert.equal(crashed.checks.length, 0);
+  assert.match(crashed.error ?? "", /backend unavailable/);
+});
+
+test("dependency findings remain separate from the project gate and model repair input", async () => {
+  const clean = report("passed");
+  clean.findingCounts = { project: 0, dependency: 1, total: 1 };
+  clean.dependencyFindings = [{ id: "dependency-only", origin: "dependency", analysis: "dead-code",
+    type: "LIBRARY_WARNING", message: "Library-only detail" }];
+  const snapshot = structuredClone(clean);
+  assert.equal(isCheckPassed(clean), true);
+  const result = await verifyTask({ task: "Write code", maxRepairs: 1, prompt: async () => {}, analyze: async () => clean });
+  assert.equal(result.outcome, "verified");
+  const summary = formatReport(clean);
+  assert.match(summary, /"dependency": 1/);
+  assert.doesNotMatch(summary, /LIBRARY_WARNING|Library-only detail/);
+  assert.match(summary, /project findings only/);
+  assert.match(summary, /check\.md/);
+  assert.deepEqual(clean, snapshot);
+});
+
+test("a bounded model summary keeps stage decisions and report paths ahead of long findings", () => {
+  const long = report("findings", true);
+  long.findings[0].message = "evidence ".repeat(5000);
+  const summary = formatReport(long);
+  assert.match(summary, /"test"/);
+  assert.match(summary, /"humanReportPath": "\/test-project\/check.md"/);
+  assert.match(summary, /\[Truncated; read full report: \/test-project\/check.json\]/);
+  assert.ok(summary.length < 25_000);
+  assert.equal(long.findings[0].message.length, 45000);
 });

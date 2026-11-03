@@ -2,6 +2,9 @@ import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 export interface ProjectConfig {
+  buildBackend?: 'javac' | 'maven-docker';
+  dependencyNetwork?: boolean;
+  includeDependencies?: boolean;
   sourceRoots?: string[];
   classpath?: string[];
   mainClass?: string;
@@ -14,12 +17,16 @@ export interface ProjectConfig {
 }
 
 /** Resolve inferred coverage before the model changes the project's layout. */
-export async function freezeProjectConfig(projectDir: string, config: ProjectConfig): Promise<ProjectConfig> {
+export async function freezeProjectConfig(projectDir: string, config: ProjectConfig,
+  inferredSourceRoots?: readonly string[]): Promise<ProjectConfig> {
   const frozen = structuredClone(config);
-  if (frozen.sourceRoots === undefined) {
-    const exists = async (path: string) => access(resolve(projectDir, path)).then(() => true, () => false);
-    frozen.sourceRoots = await exists("src/main/java") ? ["src/main/java"]
-      : await exists("src") ? ["src"] : ["."];
+  if (frozen.buildBackend !== 'maven-docker' && frozen.sourceRoots === undefined) {
+    if (inferredSourceRoots !== undefined) frozen.sourceRoots = [...inferredSourceRoots];
+    else {
+      const exists = async (path: string) => access(resolve(projectDir, path)).then(() => true, () => false);
+      frozen.sourceRoots = await exists("src/main/java") ? ["src/main/java"]
+        : await exists("src") ? ["src"] : ["."];
+    }
   }
   return frozen;
 }
@@ -38,7 +45,7 @@ export async function loadProjectConfig(projectDir: string): Promise<ProjectConf
     throw new Error(`${path} must contain a JSON object.`);
   }
   const result = config as Record<string, unknown>;
-  const allowed = ["sourceRoots", "classpath", "mainClass", "analyses", "javaVersion", "timeoutMs", "jarPath", "taintConfig", "taintImplicitEntries"];
+  const allowed = ["buildBackend", "dependencyNetwork", "includeDependencies", "sourceRoots", "classpath", "mainClass", "analyses", "javaVersion", "timeoutMs", "jarPath", "taintConfig", "taintImplicitEntries"];
   for (const key of Object.keys(result)) {
     if (!allowed.includes(key)) throw new Error(`Unknown configuration key: ${key}`);
   }
@@ -56,8 +63,13 @@ export async function loadProjectConfig(projectDir: string): Promise<ProjectConf
       throw new Error(`${key} must be a nonempty string.`);
     }
   }
-  if (result.taintImplicitEntries !== undefined && typeof result.taintImplicitEntries !== "boolean") {
-    throw new Error("taintImplicitEntries must be a boolean.");
+  if (result.buildBackend !== undefined && result.buildBackend !== 'javac' && result.buildBackend !== 'maven-docker') {
+    throw new Error('buildBackend must be javac or maven-docker.');
+  }
+  for (const key of ['taintImplicitEntries', 'dependencyNetwork', 'includeDependencies']) {
+    if (result[key] !== undefined && typeof result[key] !== 'boolean') {
+      throw new Error(`${key} must be a boolean.`);
+    }
   }
   for (const key of ["javaVersion", "timeoutMs"]) {
     if (result[key] !== undefined && (!Number.isSafeInteger(result[key]) || (result[key] as number) <= 0)) {

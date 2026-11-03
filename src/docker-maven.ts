@@ -9,6 +9,7 @@ import { writeStructuredOutputs } from './reporting.ts';
 
 export const MAVEN_IMAGE = 'taie-agent-maven:0.1';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const MAVEN_REPOSITORY_VOLUME = `taie-maven-repository-v1-${createHash('sha256').update(root).digest('hex').slice(0, 12)}`;
 const excluded = new Set(['.git', '.taie-agent', '.tools', 'node_modules', 'target', 'build', '.gradle', '.m2']);
 
 /** The same selection is hashed before copying and after checking, including POMs and tests. */
@@ -39,15 +40,20 @@ export async function projectSnapshot(projectDir: string, destination?: string, 
 export interface MavenCheckOptions extends AnalyzeJavaProjectOptions {
   /** Permit network only during explicit dependency preparation; checks always run offline. */
   dependencyNetwork?: boolean;
+  /** Include dependency details in a separate list; never change the project gate. */
+  includeDependencies?: boolean;
 }
 export interface MavenCheckResult {
-  schemaVersion: 1;
+  schemaVersion: 2;
+  statusScope: 'project';
+  includeDependencies: boolean;
   status: 'passed' | 'findings' | 'build_failed' | 'test_failed' | 'tests_not_run' | 'analysis_failed' | 'unsupported' | 'timeout' | 'error' | 'stale';
   projectDir: string;
   runDir: string;
   reportPath: string;
   image: string;
   imageId?: string;
+  storage: { backend: 'docker-volumes'; repositoryVolume: string; recoveryVolume?: string };
   snapshotFingerprint?: string;
   durationMs?: number;
   dependencyNetwork: boolean;
@@ -65,18 +71,38 @@ export async function checkMavenInDocker(options: MavenCheckOptions): Promise<Ma
   const runDir = path.join(projectDir, '.taie-agent', 'maven-runs', `${new Date().toISOString().replaceAll(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`);
   await mkdir(runDir, { recursive: true });
   const result: MavenCheckResult = {
-    schemaVersion: 1, status: 'error', projectDir, runDir, reportPath: path.join(runDir, 'report.json'),
-    image: MAVEN_IMAGE, dependencyNetwork: options.dependencyNetwork ?? false, checkNetwork: 'none', review: 'not_run', diagnostics: [],
+    schemaVersion: 2, statusScope: 'project', includeDependencies: options.includeDependencies ?? false,
+    status: 'error', projectDir, runDir, reportPath: path.join(runDir, 'report.json'),
+    image: MAVEN_IMAGE, storage: { backend: 'docker-volumes', repositoryVolume: MAVEN_REPOSITORY_VOLUME },
+    dependencyNetwork: options.dependencyNetwork ?? false, checkNetwork: 'none', review: 'not_run', diagnostics: [],
   };
   const deadline = started + (options.timeoutMs ?? 600_000);
-  const work = path.join(runDir, 'workspace');
+  let work = path.join(runDir, 'snapshot');
   const input = path.join(runDir, 'input');
-  const repository = path.join(root, '.tools', 'maven-repository');
+  const storageId = randomUUID();
+  const workVolume = `taie-maven-work-${storageId}`;
+  const inputVolume = `taie-maven-input-${storageId}`;
+  const transfer = `taie-maven-transfer-${storageId}`;
+  let storageStarted = false;
+  const mounts = ['--mount', `type=volume,source=${workVolume},target=/workspace`,
+    '--mount', `type=volume,source=${inputVolume},target=/input,readonly`,
+    '--mount', `type=volume,source=${MAVEN_REPOSITORY_VOLUME},target=/maven-repository`];
+  const dockerStep = async (name: string, args: string[], cleanup = false) => {
+    const step = await runProcess('docker', args, root, path.join(runDir, name),
+      cleanup ? Date.now() + 60_000 : deadline, cleanup ? undefined : options.signal);
+    if (step.code !== 0 || step.error || step.stopped) throw new Error(`${name}: ${step.error ?? step.tail}`);
+    return step;
+  };
+  const removeContainer = async (name: string, log: string) => {
+    const cleanup = await runProcess('docker', ['rm', '-f', name], root, path.join(runDir, log), Date.now() + 10_000);
+    if (cleanup.code !== 0 && !/No such container/i.test(cleanup.tail))
+      throw new Error(`Container cleanup failed for ${name}: ${cleanup.error ?? cleanup.tail}`);
+  };
   const localPaths = (value: unknown): unknown => {
     if (typeof value === 'string') {
       if (value.startsWith('/workspace/')) return path.join(work, value.slice('/workspace/'.length));
       if (value.startsWith('/input/')) return path.join(input, value.slice('/input/'.length));
-      if (value.startsWith('/maven-repository/')) return path.join(repository, value.slice('/maven-repository/'.length));
+      if (value.startsWith('/maven-repository/')) return path.join(work, 'dependencies', value.slice('/maven-repository/'.length));
       if (value.startsWith('file:///workspace/')) return pathToFileURL(path.join(work, decodeURIComponent(value.slice('file:///workspace/'.length)))).href;
     }
     if (Array.isArray(value)) return value.map(localPaths);
@@ -95,41 +121,68 @@ export async function checkMavenInDocker(options: MavenCheckOptions): Promise<Ma
     result.imageId = image.tail.trim();
     await mkdir(path.join(work, 'project'), { recursive: true });
     await mkdir(input);
-    await mkdir(repository, { recursive: true });
     result.snapshotFingerprint = await projectSnapshot(projectDir, path.join(work, 'project'));
     const selectedJar = options.jarPath ?? process.env.TAIE_JAR;
     const jarContents = await readFile(path.resolve(projectDir, selectedJar ?? getDefaultJarPath()));
     if (!selectedJar && createHash('sha256').update(jarContents).digest('hex') !== TAIE_SHA256)
       throw new Error('Default Tai-e JAR SHA-256 mismatch. Select a development build explicitly with --jar.');
     await writeFile(path.join(input, 'tai-e.jar'), jarContents);
-    const workerOptions: AnalyzeJavaProjectOptions = {
+    const workerOptions: AnalyzeJavaProjectOptions & { includeDependencies: boolean } = {
       projectDir: '/workspace/project', analyses: options.analyses, mainClass: options.mainClass,
       timeoutMs: Math.max(1, deadline - Date.now()), taintImplicitEntries: options.taintImplicitEntries,
+      includeDependencies: result.includeDependencies,
     };
     if (options.taintConfig) {
       await writeFile(path.join(input, 'taint.yml'), options.taintConfigContent ?? await readFile(path.resolve(projectDir, options.taintConfig)));
       workerOptions.taintConfig = '/input/taint.yml';
     }
+    // Only this trusted initialization process runs as root; project execution stays uid 1000.
+    storageStarted = true;
+    await dockerStep('repository-volume', ['volume', 'create', MAVEN_REPOSITORY_VOLUME]);
+    await dockerStep('workspace-volume', ['volume', 'create', workVolume]);
+    await dockerStep('input-volume', ['volume', 'create', inputVolume]);
+    await dockerStep('transfer-create', ['create', '--name', transfer, '--network', 'none', '--read-only',
+      '--user', '0:0', '--cap-drop=ALL', '--cap-add=CHOWN', '--security-opt=no-new-privileges',
+      '--cpus=2', '--memory=512m', '--pids-limit=64',
+      ...mounts.map(arg => arg.replace('target=/input,readonly', 'target=/input')),
+      '--entrypoint', 'node', result.imageId!, '/opt/runner/containers/maven/storage.ts', 'initialize']);
+    await dockerStep('snapshot-import', ['cp', path.join(work, 'project'), `${transfer}:/workspace/`]);
+    await writeFile(path.join(input, 'options.json'), JSON.stringify(workerOptions));
+    await dockerStep('input-import', ['cp', `${input}${path.sep}.`, `${transfer}:/input/`]);
+    await dockerStep('storage-initialize', ['start', '-a', transfer]);
     const container = async (phase: 'prepare' | 'check') => {
       const name = `taie-maven-${randomUUID()}`;
       workerOptions.timeoutMs = Math.max(1, deadline - Date.now());
       await writeFile(path.join(input, 'options.json'), JSON.stringify(workerOptions));
+      await dockerStep(`${phase}-options`, ['cp', path.join(input, 'options.json'), `${transfer}:/input/options.json`]);
       const args = ['run', '--rm', '--init', '--name', name, '--pull=never',
         '--network', phase === 'prepare' && options.dependencyNetwork ? 'bridge' : 'none',
         '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
         '--cpus=2', '--memory=2g', '--pids-limit=256', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=256m',
-        '--user', `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
-        '--mount', `type=bind,source=${work},target=/workspace`,
-        '--mount', `type=bind,source=${input},target=/input,readonly`,
-        '--mount', `type=bind,source=${repository},target=/maven-repository`,
+        '--user', '1000:1000', ...mounts,
         result.imageId!, phase, phase === 'prepare' && options.dependencyNetwork ? 'online' : 'offline'];
       try {
         return await runProcess('docker', args, root, path.join(runDir, phase), deadline, options.signal);
       } finally {
         // Killing the docker CLI does not stop its container. Remove exactly this task's named container.
-        const cleanup = await runProcess('docker', ['rm', '-f', name], root, path.join(runDir, `${phase}-cleanup`), Date.now() + 10_000);
-        if (cleanup.code !== 0 && !/No such container/i.test(cleanup.tail))
-          result.diagnostics.push(`Container cleanup failed for ${name}: ${cleanup.error ?? cleanup.tail}`);
+        await removeContainer(name, `${phase}-cleanup`);
+        // Stop all project processes before validating and exporting their output.
+        try {
+          const exporter = `taie-maven-export-${randomUUID()}`;
+          try {
+            await dockerStep(`${phase}-export-validate`, ['run', '--rm', '--name', exporter,
+              '--network', 'none', '--read-only', '--user', '1000:1000', '--cap-drop=ALL',
+              '--security-opt=no-new-privileges', '--cpus=2', '--memory=512m', '--pids-limit=64',
+              ...mounts, '--entrypoint', 'node', result.imageId!, '/opt/runner/containers/maven/storage.ts', 'export'], true);
+          } finally { await removeContainer(exporter, `${phase}-export-cleanup`); }
+          work = path.join(runDir, `${phase}-workspace`);
+          await mkdir(work);
+          await dockerStep(`${phase}-export`, ['cp', `${transfer}:/workspace/.`, work], true);
+        } catch (error) {
+          result.storage.recoveryVolume = workVolume;
+          result.diagnostics.push(`Workspace export failed; evidence retained in Docker volume ${workVolume}.`);
+          throw error;
+        }
       }
     };
     const preparation = await container('prepare');
@@ -173,6 +226,9 @@ export async function checkMavenInDocker(options: MavenCheckOptions): Promise<Ma
     const payload = localPaths(JSON.parse(await readFile(path.join(work, 'check.json'), 'utf8'))) as { maven: MavenReport; analysis?: AnalysisReport };
     result.maven = payload.maven;
     result.analysis = payload.analysis;
+    if (result.analysis?.status === 'completed' && result.analysis.findingScope !== 'project') {
+      throw new Error('Maven image lacks project/dependency classification. Rebuild with npm run build:maven-image.');
+    }
     result.diagnostics.push(...payload.maven.diagnostics, ...(payload.analysis?.diagnostics ?? []));
     if (result.analysis) {
       const analysisDir = path.join(runDir, 'analysis');
@@ -193,7 +249,7 @@ export async function checkMavenInDocker(options: MavenCheckOptions): Promise<Ma
       : payload.analysis.findings.length ? 'findings' : 'passed';
     if (result.status === 'passed' && checked.code !== 0) throw new Error(`Container check failed with exit code ${checked.code}.`);
     if (await projectSnapshot(projectDir) !== result.snapshotFingerprint
-        || await projectSnapshot(snapshotDir, undefined, ignoredOutputDirs) !== filteredBaseline) {
+        || await projectSnapshot(path.join(work, 'project'), undefined, ignoredOutputDirs) !== filteredBaseline) {
       result.status = 'stale';
       result.diagnostics.push('Project inputs changed after snapshot creation (in the original project or during its build/tests).');
     }
@@ -201,6 +257,19 @@ export async function checkMavenInDocker(options: MavenCheckOptions): Promise<Ma
     result.status = options.signal?.aborted || Date.now() >= deadline ? 'timeout' : 'error';
     result.diagnostics.push(error instanceof Error ? error.message : String(error));
   } finally {
+    if (storageStarted) {
+      try { await removeContainer(transfer, 'transfer-cleanup'); }
+      catch (error) { result.diagnostics.push(String(error)); result.status = 'error'; }
+      for (const volume of [workVolume, inputVolume]) {
+        if (volume === result.storage.recoveryVolume) continue;
+        const cleanup = await runProcess('docker', ['volume', 'rm', volume], root,
+          path.join(runDir, volume === workVolume ? 'workspace-volume-cleanup' : 'input-volume-cleanup'), Date.now() + 10_000);
+        if (cleanup.code !== 0 && !/no such volume/i.test(cleanup.tail)) {
+          result.diagnostics.push(`Volume cleanup failed for ${volume}: ${cleanup.error ?? cleanup.tail}`);
+          result.status = 'error';
+        }
+      }
+    }
     result.durationMs = Date.now() - started;
     await writeFile(result.reportPath, JSON.stringify(result, null, 2));
   }

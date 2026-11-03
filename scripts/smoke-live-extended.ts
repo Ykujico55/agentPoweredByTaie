@@ -41,16 +41,18 @@ async function main() {
       'and invoke taie_analyze to validate your actual changes. Do not delete code, suppress analysis or change analysis configuration.',
     ].join('\n'));
     evidence.agentRun = report;
-    assert.equal(report.outcome, 'verified', report.error ?? 'Host did not verify the final code.');
+    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.outcome, 'incomplete', report.error ?? 'Javac must report missing project tests.');
     assert.ok(report.repairRounds >= 1, 'The host did not execute the feedback-and-repair stage.');
     assert.ok(report.checks[0].findings.some(finding => finding.type === 'INTEGER_DIVIDE_BY_ZERO'));
     assert.ok(report.toolCalls.includes('taie_get_finding'), 'Model did not inspect finding evidence.');
     assert.ok(report.toolCalls.includes('taie_analyze'), 'Model did not call the actual analyzer.');
-    assert.equal(report.checks.at(-1)?.status, 'completed');
+    assert.equal(report.checks.at(-1)?.status, 'tests_not_run');
+    assert.equal(report.checks.at(-1)?.stages.analysis, 'completed');
     assert.equal(report.checks.at(-1)?.findings.length, 0);
     assertions.push('A real host analysis found INTEGER_DIVIDE_BY_ZERO before model edits.');
     assertions.push('The host sent actual feedback; the model retrieved finding evidence, edited code and invoked Tai-e.');
-    assertions.push('The last independent host build/analysis completed without findings.');
+    assertions.push('The last independent host build/analysis completed without findings; missing project tests remain explicit as incomplete.');
     const harness = path.join(runDir, 'DividerAssertions.java');
     await writeFile(harness, [
       'public class DividerAssertions {',
