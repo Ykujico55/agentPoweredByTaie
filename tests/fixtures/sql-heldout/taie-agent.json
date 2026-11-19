@@ -1,0 +1,7 @@
+{
+  "buildBackend": "maven-docker",
+  "analyses": ["taint"],
+  "mainClass": "example.Main",
+  "taintConfig": "taint.yml",
+  "taintImplicitEntries": false
+}

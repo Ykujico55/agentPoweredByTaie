@@ -191,19 +191,45 @@ test('--help documents configurable settings, launch flags, and local chat comma
     const result = await runCli(['--help'], [], directory);
     assert.equal(result.timedOut, false);
     assert.equal(result.exitCode, 0, result.stderr);
-    for (const flag of ['project', 'build-backend', 'baseline', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+    for (const flag of ['project', 'build-backend', 'acceptance-java', 'baseline', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
       'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
       'taint-implicit-entries', 'java-version', 'jar', 'json', 'prompt', 'prompt-file', 'skip-taie', 'no-repair', 'help',
-      'dependency-network', 'include-dependencies']) {
+      'dependency-network', 'include-dependencies', 'report', 'finding']) {
       assert.match(result.stdout, new RegExp(`^\\s+--${flag}(?=\\s|$)`, 'm'), flag);
     }
-    for (const command of ['/config', '/settings', '/set', '/repair', '/analysis', '/check', '/help', '/exit']) {
+    for (const command of ['/config', '/settings', '/set', '/repair', '/analysis', '/check', '/review', '/help', '/exit']) {
       assert.ok(result.stdout.includes(command), command);
     }
     assert.match(result.stdout, /repair-mode=ask/);
     assert.match(result.stdout, /first message only/);
+    assert.match(result.stdout, /Review completion.*not that quality checks passed/);
     assert.doesNotMatch(result.stdout, /host checks:|Tool:|\bverified;/);
     assert.deepEqual(await readdir(directory), []);
+  });
+});
+
+test('review requires explicit saved evidence and remains separate from task overrides', { timeout: 30_000 }, async () => {
+  await workspace(async directory => {
+    const project = path.join(directory, 'review project');
+    const result = await runCli(['chat', '--project', project], [
+      '--skip-taie --no-repair', '/review missing-id', '/config', '/exit',
+    ], directory);
+    assertLocal(result, 1);
+    assert.match(result.stderr, /请先运行 \/check/);
+    assert.match(result.stderr, /下一条任务覆盖：跳过检测 不修复/);
+    assert.doesNotMatch(result.stderr, /\[复核\] 调用模型|No credentials/);
+    await assertOnlyConfig(project);
+    const missing = await runCli(['review', '--project', project], [], directory);
+    assertLocal(missing, 1);
+    assert.match(missing.stderr, /review requires --report.*--finding/);
+    const wrongCommand = await runCli(['analyze', '--project', project, '--report', 'check.json'], [], directory);
+    assertLocal(wrongCommand, 1);
+    assert.match(wrongCommand.stderr, /--report applies only to review/);
+    const absentFile = await runCli(['review', '--project', project, '--report', path.join(project, 'missing.json'), '--finding', 'id'], [], directory);
+    assertLocal(absentFile, 1);
+    assert.match(absentFile.stderr, /ENOENT/);
+    assert.doesNotMatch(absentFile.stderr, /\[复核\] 调用模型|No credentials/);
+    await assertOnlyConfig(project);
   });
 });
 
@@ -248,10 +274,14 @@ test('Maven selection reaches model authentication without starting a check or f
   await workspace(async directory => {
     const project = path.join(directory, 'maven selected');
     const result = await runCli(['chat', '--project', project, '--build-backend', 'maven-docker'], [
-      'Write a Java class', '/config', '/set build-backend javac', '/config', '/exit',
+      '/set acceptance-java ../missing/Verifier.java', 'Write a Java class', '--skip-taie Discuss the task',
+      '/config', '/set build-backend javac', 'Build with this verifier', '/config', '/exit',
     ], directory, 60_000); // This case loads the real Pi SDK; local-only commands retain their 20s bound.
     assertLocal(result, 1);
     assert.match(result.stderr, /No credentials for deepseek/);
+    assert.match(result.stderr, /ENOENT[^\n]*Verifier\.java/);
+    assert.match(result.stderr, /业务验收需要 --build-backend maven-docker/);
+    assert.equal((result.stderr.match(/正在准备模型会话/g) ?? []).length, 1);
     assert.doesNotMatch(result.stderr, /maven-docker 当前仅支持 \/check/);
     assert.equal(panels(result.stderr)[0]['build-backend'], 'maven-docker');
     assert.equal(panels(result.stderr).at(-1)!['build-backend'], 'javac');
@@ -295,11 +325,13 @@ test('project switching loads build settings without carrying network permission
     await mkdir(original);
     const originalConfig = JSON.stringify({ buildBackend: 'maven-docker', dependencyNetwork: true, includeDependencies: true });
     await writeFile(path.join(original, 'taie-agent.json'), originalConfig);
-    const result = await runCli(['chat', '--project', original], [
+    const result = await runCli(['chat', '--project', original, '--acceptance-java', 'scripts/acceptance/QuoteAcceptance.java'], [
       `/set project "${target}"`, '/config', '/exit',
     ], directory);
     assertLocal(result);
     const displayed = panels(result.stderr);
+    assert.equal(JSON.parse(displayed[0]['acceptance-java']), path.join(repoRoot, 'scripts', 'acceptance', 'QuoteAcceptance.java'));
+    assert.equal(displayed.at(-1)!['acceptance-java'], 'unset');
     assert.equal(displayed[0]['build-backend'], 'maven-docker');
     assert.equal(displayed[0]['dependency-network'], 'on');
     assert.equal(displayed.at(-1)!['build-backend'], 'javac');

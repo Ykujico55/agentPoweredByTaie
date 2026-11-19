@@ -1,0 +1,30 @@
+call-site-mode: true
+sources:
+  - kind: call
+    method: "<example.CaseA: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseB: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseC: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseD: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseE: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseF: java.lang.String read(java.lang.String)>"
+    index: result
+sinks:
+  - method: "<java.sql.Statement: java.sql.ResultSet executeQuery(java.lang.String)>"
+    index: 0
+transfers:
+  - method: "<java.lang.String: java.lang.String concat(java.lang.String)>"
+    from: base
+    to: result
+  - method: "<java.lang.String: java.lang.String concat(java.lang.String)>"
+    from: 0
+    to: result

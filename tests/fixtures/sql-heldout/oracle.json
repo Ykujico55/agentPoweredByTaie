@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "scope": "Six new synthetic cases, fixed before observing held-out model responses; investigator-only truth and facts, never model input.",
+  "conditions": [
+    "input is untrusted and the intended operation is the fixed account query; this is not an authorized SQL console.",
+    "The recorded Java sources and fixed taint source/sink policy are the analyzed version.",
+    "Standard single-threaded Java semantics; local objects and arrays are not externally mutated or instrumented.",
+    "The JDBC implementation executes the submitted SQL. H2 observations demonstrate existence of changed query behavior, not universal safety.",
+    "For safe cases, the statement applies to every path reaching the unique sink and every input string including null; exceptions or early return before the sink do not constitute an injection.",
+    "No finding is a retained detection result, not a reason to change a case or claim that the model filtered a false positive."
+  ],
+  "cases": [
+    {
+      "id": "G",
+      "className": "example.CaseG",
+      "truth": "vulnerable",
+      "basis": "At mode<0 the source return directly becomes query. At positive even mode>=2 route returns the same source-derived argument. Both paths reach the same sink. Modes 0,1 and positive odd modes use a fixed query, which cannot refute the feasible input-derived paths.",
+      "sink": "<example.CaseG: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(query)",
+      "paths": ["mode<0: read -> value -> query -> sink", "mode>=2 and even: read -> value -> route(text,mode) -> query -> sink", "mode=0 or mode=1 or positive odd: constant query -> sink"],
+      "facts": ["read(input) is called once and its result is assigned to value, not discarded.", "route is private static and returns text only when mode is even.", "The two feasible source-to-sink routes share one source call and one sink call.", "Main passes args[0] as input and args[1] parsed as mode."]
+    },
+    {
+      "id": "H",
+      "className": "example.CaseH",
+      "truth": "safe_under_stated_assumptions",
+      "basis": "The only sink is guarded by mode>=0 and mode<=2. Source assignments require mode<-1 or mode>2, both incompatible with that sink guard. mode is an unchanged primitive parameter. Thus every sink execution uses the initial constant, while all other mode partitions return null without executing SQL.",
+      "sink": "<example.CaseH: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(query)",
+      "paths": ["mode<-1: source assignment but sink skipped", "mode=-1: no source assignment and sink skipped", "0<=mode<=2: source assignments skipped, constant sink", "mode>2: source assignment but sink skipped"],
+      "facts": ["There are two source-derived query assignments in mutually exclusive numeric ranges.", "mode is never reassigned and no arithmetic overflow is involved in the comparisons.", "Only modes 0,1,2 execute the sink; all other int values return null.", "Returning null is distinct from passing null to executeQuery."]
+    },
+    {
+      "id": "I",
+      "className": "example.CaseI",
+      "truth": "vulnerable",
+      "basis": "first and second are distinct new Box objects. For nonnegative mode cursor initially aliases first; iteration index=0 writes source-derived value into first.query, which reaches the sink. At mode=1 the second iteration also writes through first. Negative mode only writes second and the sink remains constant; that safe route cannot refute the nonnegative routes.",
+      "sink": "<example.CaseI: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(first.query)",
+      "paths": ["mode>=0: cursor=first, iteration 0 stores source, first.query -> sink", "mode=1: iteration 1 aliases first and stores source again -> sink", "mode<0: cursor=second, first.query remains constant -> sink"],
+      "facts": ["The loop runs exactly twice, with index=0 then index=1.", "The sink reads first.query, not cursor.query or second.query.", "Both Box constructors receive a fixed query; source data is written only afterward.", "No invocation return value is discarded in this propagation; the flow crosses an instance field."]
+    },
+    {
+      "id": "J",
+      "className": "example.CaseJ",
+      "truth": "safe_under_stated_assumptions",
+      "basis": "Both mode partitions assign source-derived value only to slots[0] and assign the same constant to slots[1], in different orders. The two-element local array does not escape and the sole sink reads index 1. Under exact Java indexing, no source write can affect index 1 for any input or mode.",
+      "sink": "<example.CaseJ: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(slots[1])",
+      "paths": ["mode<0: write source to index 0, constant to index 1, read index 1", "mode>=0: write constant to index 1, source to index 0, read index 1"],
+      "facts": ["slots is a fresh array of length 2.", "All indices are integer literals 0 or 1; no symbolic index aliases them at runtime.", "Both branches assign both elements before the sink, including mode=0 in the else branch.", "An index-insensitive abstract flow does not imply an actual write to slots[1]."]
+    },
+    {
+      "id": "K",
+      "className": "example.CaseK",
+      "truth": "vulnerable",
+      "basis": "mode=1 and mode=2 each assign the source-derived value and reach the sink without the later mode==0 overwrite. mode=0 initially assigns the source and falls through case 1, but the post-switch conditional overwrites it with a constant. Refuting only mode=0 cannot refute the other two feasible paths.",
+      "sink": "<example.CaseK: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(query)",
+      "paths": ["mode=0: source assignment -> fallthrough case 1 -> post-switch constant overwrite -> sink", "mode=1: source assignment -> break -> no overwrite -> sink", "mode=2: source assignment -> break -> no overwrite -> sink", "other modes: default constant -> sink"],
+      "facts": ["case 0 has no break and falls through case 1.", "The conditional inside case 1 is false when control fell through from mode=0.", "Only mode=0 receives the post-switch constant overwrite.", "mode is never reassigned."]
+    },
+    {
+      "id": "L",
+      "className": "example.CaseL",
+      "truth": "safe_under_stated_assumptions",
+      "basis": "The fresh local Draft object does not escape. Normal execution and both explicit caught exception paths can write source data into draft.query, but every path that reaches the sole sink must execute finally, which unconditionally overwrites that same field with the fixed query. No intervening write occurs before the sink read. An uncaught exception would prevent reaching the sink rather than execute a tainted query.",
+      "sink": "<example.CaseL: java.sql.ResultSet execute(java.sql.Statement,java.lang.String,int)> -> Statement.executeQuery(draft.query)",
+      "paths": ["mode>0: source store in try -> finally constant store -> sink", "mode<0: IllegalArgumentException -> matching catch source store -> finally constant store -> sink", "mode=0: source store in try -> IllegalStateException -> matching catch source store -> finally constant store -> sink"],
+      "facts": ["The sink is after the try/catch/finally statement, not inside finally.", "The finally assignment targets the same draft.query field read at the sink.", "Both exception handlers write source data, but their writes are also overwritten.", "The Draft constructor is implicit and no other method mutates the object."]
+    }
+  ]
+}

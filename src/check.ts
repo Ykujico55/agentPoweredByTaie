@@ -173,7 +173,8 @@ export function renderCheckResult(result: CheckResult): string {
     ...(result.comparison ? [result.comparison.counts
       ? `相对基线：新增 ${result.comparison.counts.added}；消失 ${result.comparison.counts.removed}；仍存在 ${result.comparison.counts.persisting}；变化 ${result.comparison.counts.changed}`
       : `基线比较：${result.comparison.status}；${result.comparison.reason ?? '无法比较'}`] : []),
-    ...result.findings.slice(0, 10).map(finding => `  [project] ${finding.type}: ${finding.className ?? ''}${finding.startLine ? `:${finding.startLine}` : ''}`),
+    ...result.findings.slice(0, 10).map(finding => `  [project] ${finding.type}: ${finding.className ?? ''}${finding.startLine ? `:${finding.startLine}` : ''} · ID: ${finding.id}`),
+    ...(result.findings.length ? ['聊天中可用 /review <告警ID> 获取只读模型建议；完整告警列表见质检报告。'] : []),
     ...(result.dependencyFindings?.slice(0, 10).map(finding => `  [dependency] ${finding.type}: ${finding.className ?? ''}${finding.startLine ? `:${finding.startLine}` : ''}`) ?? []),
     ...result.diagnostics,
     'passed 仅表示构建、测试与所选分析通过；复核未运行，零告警不证明没有缺陷。',

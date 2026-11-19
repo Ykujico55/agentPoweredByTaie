@@ -38,7 +38,7 @@ test("an analysis can lock a later write in the same batch and authorization unl
   const denied = await guard(write);
   assert.equal(denied?.block, true);
   assert.equal(denied?.terminate, undefined);
-  assert.match(denied?.reason ?? "", /user authorization/i);
+  assert.match(denied?.reason ?? "", /host.*repair round/i);
   assert.deepEqual(previousCalls, ["taie_analyze"]);
 
   locked = false;
@@ -54,7 +54,7 @@ test("a locked guard rejects edit and both shells without delegating to a permis
     const denied = await guard(toolContext(name));
     assert.equal(denied?.block, true, name);
     assert.equal(denied?.terminate, undefined, name);
-    assert.match(denied?.reason ?? "", /user authorization/i, name);
+    assert.match(denied?.reason ?? "", /host.*repair round/i, name);
   }
 });
 

@@ -10,9 +10,10 @@ import { Type } from "typebox";
 import { checkProject, findingEvidence, type CheckResult } from "./check.ts";
 import type { ProjectConfig } from "./config.ts";
 import { freezeProjectConfig } from "./config.ts";
-import { verifyTask, formatReport, isCheckPassed, type VerificationResult, type RepairMode, type BaselineResult } from "./verification.ts";
+import { verifyTask, formatReport, isCheckPassed, type VerificationResult, type VerificationOptions, type RepairMode, type BaselineResult } from "./verification.ts";
 import type { AgentTurnOptions } from "./turn.ts";
 import { guardRepairTools } from "./repair-guard.ts";
+import { reviewForRepair } from "./repair-review.ts";
 
 export interface AgentOptions {
   projectDir: string;
@@ -23,7 +24,8 @@ export interface AgentOptions {
   maxTurns: number;
   timeoutMs: number;
   repairMode?: RepairMode;
-  confirmRepair?: (report: CheckResult, nextRound: number) => Promise<boolean>;
+  confirmRepair?: VerificationOptions["confirmRepair"];
+  acceptBusiness?: VerificationOptions["acceptBusiness"];
   onText?: (text: string) => void;
   onStatus?: (text: string) => void;
 }
@@ -122,7 +124,7 @@ export async function createTaieAgent(options: AgentOptions) {
       lastCheck = report;
       const cleanWithoutTests = report.status === 'tests_not_run' && report.stages.build === 'passed'
         && report.stages.analysis === 'completed' && report.findings.length === 0 && report.findingCounts.project === 0;
-      if (repairModeForTurn !== "auto" && !isCheckPassed(report) && !cleanWithoutTests) writeLocked = true;
+      if (report.findings.length || (repairModeForTurn !== "auto" && !isCheckPassed(report) && !cleanWithoutTests)) writeLocked = true;
       log({ type: "taie_tool_report", report });
       const instruction = writeLocked ? "\n\nHost repair policy: writes and shell commands are now paused. Explain these results and stop. The host will handle any repair decision; do not attempt to repair in this response." : "";
       return { content: [{ type: "text", text: formatReport(report) + instruction }], details: report };
@@ -213,11 +215,12 @@ export async function createTaieAgent(options: AgentOptions) {
         ? "Host policy for this user task: the user explicitly disabled Tai-e. Do not invoke Tai-e or compile the project for Tai-e, including through shell commands. No host verification or repair loop will run. Do not claim this task is verified. This policy applies only to this task."
         : "Host policy for this user task: Tai-e is enabled. Any skip policy from a previous task has expired. Use taie_analyze after meaningful Java changes; the host will independently run a fresh build/test/analysis check after your response.";
       const repairPolicy = repairMode === "auto"
-        ? "Repair policy: auto. Repair supported defects while preserving the requested behavior."
+        ? "Repair policy: auto. After taie_analyze reports project findings, summarize them and finish this response. The host reviews each finding and starts a repair round for located defects."
         : `Repair policy: ${repairMode}. You may implement the requested example or feature, but must preserve deliberately introduced defects. A pre-task baseline does not pause this requested work. After your taie_analyze call reports build failures, failed tests or project analysis findings, explain them and stop; do not fix them, even if you think a fix is easy. The host ${repairMode === "ask" ? "will ask the human before starting a repair round" : "will not start automatic repairs"}. Never delete or weaken tests, suppress detectors or change build configuration to obtain a passing result.`;
       const controller = new AbortController();
       currentTaskSignal = controller.signal;
       let timedOut = false;
+      let cancelled = false;
       let remainingMs = settings.timeoutMs;
       let activeSince = Date.now();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -225,7 +228,15 @@ export async function createTaieAgent(options: AgentOptions) {
         activeSince = Date.now();
         timer = setTimeout(() => { timedOut = true; controller.abort(); void session.abort(); }, Math.max(0, remainingMs));
       };
-      armTimer();
+      const cancel = () => {
+        cancelled = true;
+        clearTimeout(timer);
+        controller.abort();
+        void session.abort();
+      };
+      turnOptions.signal?.addEventListener("abort", cancel, { once: true });
+      if (turnOptions.signal?.aborted) cancel();
+      else armTimer();
       const repairDecisions: { round: number; approved: boolean }[] = [];
       let prompts = 0;
       running = true;
@@ -234,9 +245,12 @@ export async function createTaieAgent(options: AgentOptions) {
         result = await verifyTask({
           task,
           skipTaie,
+          signal: controller.signal,
+          onStatus: options.onStatus,
           baselineEnabled: frozenConfig.baselineEnabled,
           maxRepairs: settings.maxRepairs,
           repairMode,
+          acceptBusiness: turnOptions.acceptBusiness ?? settings.acceptBusiness,
           onBaseline(baseline) {
             taskBaseline = baseline;
             lastCheck = baseline.check;
@@ -244,21 +258,22 @@ export async function createTaieAgent(options: AgentOptions) {
             if (baseline.check) options.onStatus?.(`Baseline: ${baseline.status}; check=${baseline.check.status}; project findings=${baseline.check.findingCounts.project}; report: ${baseline.check.humanReportPath}`);
             else options.onStatus?.(`Baseline: ${baseline.status}${baseline.error ? `; ${baseline.error}` : ""}`);
           },
-          async confirmRepair(report, round) {
+          async confirmRepair(report, round, targets, businessFailures) {
             clearTimeout(timer);
             remainingMs -= Date.now() - activeSince;
             try {
-              const approved = timedOut ? false : await settings.confirmRepair?.(report, round) ?? false;
+              const approved = timedOut || cancelled ? false : await settings.confirmRepair?.(report, round, targets, businessFailures) ?? false;
               repairDecisions.push({ round, approved });
-              log({ type: "repair_decision", round, approved, reportPath: report.reportPath });
+              log({ type: "repair_decision", round, approved, reportPath: report.reportPath, findingIds: targets.map(finding => finding.id), businessFailures });
               return approved;
-            } finally { if (!timedOut) armTimer(); }
+            } finally { if (!timedOut && !cancelled) armTimer(); }
           },
           async prompt(text) {
+            if (cancelled) throw new Error("Agent task cancelled.");
             if (timedOut) throw new Error("Agent task timed out.");
             const isRepair = prompts++ > 0;
             if (isRepair) writeLocked = false;
-            const phasePolicy = isRepair ? "The host has authorized this repair round. You may now edit to fix the reported issues. After the next analysis, report results and stop if further repairs require another human decision." : repairPolicy;
+            const phasePolicy = isRepair ? "The host has authorized this repair round. Edit only to address the targets in the host's repair request. After checking your edits, summarize the result and finish this response." : repairPolicy;
             const backend = frozenConfig.buildBackend ?? 'javac';
             const coverage = backend === 'maven-docker' ? 'Source roots and classpath come from the Maven build; checks run offline in Docker.'
               : `Configured source roots: ${JSON.stringify(frozenConfig.sourceRoots)}. Project tests are not run by this backend.`;
@@ -274,6 +289,17 @@ export async function createTaieAgent(options: AgentOptions) {
             }
           },
           analyze: baseline => analyze(controller.signal, baseline),
+          async reviewFinding(check, finding) {
+            if (turns >= settings.maxTurns) throw new Error(`Agent exceeded ${settings.maxTurns} model turns.`);
+            turns++;
+            return reviewForRepair({ projectDir, reportPath: check.reportPath, findingId: finding.id,
+              provider: settings.provider, model: settings.model, timeoutMs: settings.timeoutMs, signal: controller.signal }, () => {
+              if (turns >= settings.maxTurns || controller.signal.aborted) return false;
+              turns++;
+              options.onStatus?.(`复核建议疑似误报，Tai-e 记录了整数除数为零。正在核对告警 ${finding.id}。`);
+              return true;
+            });
+          },
           onCheck(report) {
             lastCheck = report;
             if (repairMode !== "auto") writeLocked = true;
@@ -283,6 +309,7 @@ export async function createTaieAgent(options: AgentOptions) {
         });
       } finally {
         clearTimeout(timer);
+        turnOptions.signal?.removeEventListener("abort", cancel);
         currentTaskSignal = undefined;
         taskBaseline = undefined;
         skipTaieForTurn = false;
@@ -291,6 +318,7 @@ export async function createTaieAgent(options: AgentOptions) {
         if (skipTaie) session.setActiveToolsByName(activeTools);
       }
       if (timedOut) result = { ...result, outcome: "agent_error", error: "Agent task timed out." };
+      else if (cancelled) result = { ...result, outcome: "agent_error", error: "Agent task cancelled." };
       const report = {
         ...result, runDir, skipTaie, repairMode, repairDecisions, toolCalls: toolCalls.slice(initialToolCount),
         configuration: { projectDir, config: structuredClone(frozenConfig), provider: settings.provider, model: settings.model, maxRepairs: settings.maxRepairs, maxTurns: settings.maxTurns, timeoutMs: settings.timeoutMs },

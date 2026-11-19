@@ -1,0 +1,23 @@
+call-site-mode: true
+sources:
+  - kind: call
+    method: "<example.CaseG: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseH: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseI: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseJ: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseK: java.lang.String read(java.lang.String)>"
+    index: result
+  - kind: call
+    method: "<example.CaseL: java.lang.String read(java.lang.String)>"
+    index: result
+sinks:
+  - method: "<java.sql.Statement: java.sql.ResultSet executeQuery(java.lang.String)>"
+    index: 0

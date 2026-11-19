@@ -6,7 +6,7 @@
 npm start -- chat --project examples/playground
 ```
 
-聊天中的 `/config` 和 `/settings` 显示同一份完整配置面板，包括全部 22 项设置、对应 CLI flag、有效默认值和解析后的绝对路径。`/help` 显示完整 CLI 帮助，`/exit` 退出聊天。
+聊天中的 `/config` 和 `/settings` 显示同一份完整配置面板，包括全部设置、对应 CLI flag、有效默认值和解析后的绝对路径。`/help` 显示完整 CLI 帮助，`/exit` 退出聊天。
 
 ```text
 /config
@@ -38,6 +38,14 @@ npm start -- chat --project examples/playground
 `build-backend` 同时控制模型的 `taie_analyze`、任务结束后的宿主验收和手动 `/check`，三者使用相同的阶段报告。Maven 后端不可用时保留错误，不回退宿主 javac。模型的 shell 和文件工具仍在宿主执行；当前隔离范围是 Maven 构建、测试和 Tai-e 链路。
 
 例如启动 `npm start -- chat --project tests/fixtures/maven-simple --build-backend maven-docker`，输入代码任务即可使用 Maven 自检；CLI 默认 `ask`，发现可修复的构建错误、测试失败或项目告警后，展示阶段结果和质检报告，再询问是否允许修复。未运行测试、分析器故障、超时、后端错误或过期结果不会自动转成代码修复任务。javac 若有项目告警可按策略修复，但清除告警后仍因未运行测试返回 `incomplete`。
+
+### 独立业务验收
+
+在 `run` 或 `chat` 启动时传入 `--acceptance-java <文件>`，路径相对启动目录。聊天中可用 `/set acceptance-java ../acceptance/Verifier.java`，路径相对当前项目。需要从编码工作目录中隐藏验收判据时，可将文件放在项目外。每条启用自检的编码任务在调用模型前读取一次该文件，随后各轮复用同一份内容。切换项目、输入 `/set acceptance-java unset` 会清除配置。`--skip-taie` 或 `/analysis off` 跳过该轮验收。手动 `/check` 只运行项目检查。
+
+Maven 构建、实际测试和 Tai-e 都通过，且项目零告警时，宿主在原检查使用的镜像中用该次构建的类和依赖运行 Java 验收程序。程序每项输出一行 `PASS 用例名` 或 `FAIL 用例名 预期值与实际值`，最后输出 `通过数/总数 passed`，例如 `7/8 passed`。全部通过时退出码为 0，有失败时为 1。示例见 [订单报价验收程序](../scripts/acceptance/QuoteAcceptance.java)。
+
+业务失败时，宿主按 `repair-mode` 和剩余修复预算处理，修复提示包含失败用例描述。通过后返回 `verified`，仍有业务失败则返回 `unresolved`。验收程序启动失败或输出协议错误返回 `check_failed`。任务结果中的 `businessChecks` 关联每次业务验收与对应的项目检查。
 
 统一结果保存为本次后端运行目录中的 `check.json`（`schemaVersion: 1`），原有 `report.json` 不变，`backendReportPath` 和 `backendStatus` 保留原始证据与状态。`stages` 分别记录构建、测试、分析、复核；`findings` 只含项目告警，`findingCounts` 分列项目和依赖计数。javac 入口同样按实际编译出的类分层，原始 APP 报告保留全部告警。
 
@@ -75,6 +83,24 @@ npm start -- chat --project examples/playground
 agent 结果中的 `baseline.status` 为 `completed`、`failed`、`disabled` 或 `skipped`。`completed` 表示采集完成，不表示无告警或测试已运行；`failed` 保留实际失败报告或异常。基线失败仍允许原始编写任务继续，不把空项目或失败分析伪装成零告警，也不自动授权修复与任务无关的既有问题。
 
 检查结果的 `comparison` 和中文 `check.md` 展示阶段变化，以及新增、消失、延续、变化的项目告警。依赖告警不参与这组计数；项目、后端、检测器或分析环境无法对应，或构建/分析证据不可用时不给增减数字。测试失败但构建和分析已完成时，可以比较静态告警，测试失败仍保留。告警消失不等于修复成功，变化不等于误报判定；最终验收仍要求实际测试通过、分析完成且全部项目告警清零，包括修改前已有告警。
+
+## 显式只读复核
+
+在 `/check` 或模型任务的最终宿主检查后，从报告找到一条项目告警 ID，输入 `/review <告警ID>`。命令使用本会话最近的检查报告；没有报告时提示先运行 `/check`，切换项目会清空这个引用。它仅复核一条告警，不自动复核每轮或全部告警。
+
+复核使用现有的 `provider`、`model`、`timeout` 设置，会发送记录中的告警局部证据并产生模型 API 用量。该请求独立于编码对话，没有读写文件、shell 或其他工具，不加载项目指令。`/analysis off` 不禁用显式 `/review`；复核也不消耗已预定的 `--skip-taie` / `--no-repair`，不发起修复或重新分析。执行中可用 Ctrl+C 取消。
+
+结果单独写入 `.taie-agent/reviews/<运行ID>/review.json` 和 `review.md`，记录实际请求、模型原始响应、证据范围和输入指纹。只有构建与分析已完成的项目告警可复核；项目测试失败仍保留，依赖告警不属于本入口的范围。原检查报告和告警计数不变，人工处置始终待处理。
+
+建议只针对报告记录的输入，`currentWorkspace: not_checked` 明确表示未核验当前源码或会话分析配置。当前工作区变化不会自动被标为过期；需要确认当前版本时先重新 `/check`。复核期间原检查报告本身变化会返回 `stale`。证据不足或单路径证伪不能成为关闭整条告警的依据。
+
+也可独立运行：
+
+```powershell
+npm start -- review --project examples/playground --report "<check.json绝对路径>" --finding "<项目告警ID>"
+```
+
+`--report` 相对启动目录解析；`--report` 与 `--finding` 只用于独立 `review` 命令。`--json` 或 `/set json on` 保持结果 JSON 输出到 stdout，提示输出到 stderr。复核 `completed` 的退出码 0 只表示建议已记录；`failed` / `stale` 为 1，都不代表质检通过或告警已关闭。协议和判断限制见 [只读复核说明](review.md)。
 
 ## 修复策略
 
@@ -147,6 +173,7 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 | --- | --- | --- |
 | `project` | 当前项目目录 | `/set project ../other-java-project` |
 | `build-backend` | 模型工具、宿主验收和 `/check` 共用后端，默认 `javac` | `/set build-backend maven-docker` |
+| `acceptance-java` | Maven 编码任务使用的 Java 业务验收文件，默认 `unset` | `/set acceptance-java ../acceptance/Verifier.java` |
 | `dependency-network` | Maven 准备阶段联网，默认 `off` | `/set dependency-network on` |
 | `include-dependencies` | `/check` 展示单列依赖告警，默认 `off` | `/set include-dependencies on` |
 | `provider` | `deepseek`，启动时可由环境变量覆盖 | `/set provider deepseek` |
@@ -196,6 +223,14 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 
 例如，当前项目是 `D:/work/demo` 时，`/set project ../other` 切换到 `D:/work/other`；随后 `/set taint-config policy.yml` 指向 `D:/work/other/policy.yml`。面板显示解析后的绝对路径，Java home 环境状态仅供查看，不提供 API key 的显示或设置入口。
 
+## 等待与取消任务
+
+提交消息后，界面依次显示准备模型会话、记录基线、等待模型回复和最终检查。默认基线在请求模型前执行，`--timeout` 控制任务总时限，`--analysis-timeout` 控制单次检查时限，单位均为毫秒。
+
+任务、检查或复核进行时按 Ctrl+C 可请求取消；完成取消和证据保存后返回聊天输入。等待修复确认时也可取消，下一条聊天消息仍可正常输入。取消的模型任务记录为 `agent_error`，错误为 `Agent task cancelled.`；超时记录为 `Agent task timed out.`。
+
+只讨论问题时，可输入 `--skip-taie 你的问题` 跳过本轮基线及最终检查，或使用 `/analysis off` 持续关闭后续消息的自动检查。`/set baseline off` 只关闭请求前的基线，保留最终检查。
+
 ## 配置生效与会话历史
 
 多数设置在原会话中修改，保留对话历史，并在下一条任务中应用；正在执行的任务不会中途切换配置。模型、修复策略、预算和分析配置都可以通过面板管理。
@@ -210,13 +245,15 @@ npm start -- run --project examples/playground --skip-taie --prompt '解释静�
 
 agent 结果现为 **`schemaVersion: 2`**，`baseline` 单列修改前结果，`checks` 只保存任务后的统一 `CheckResult`（含 `stages`、项目/依赖计数、可用时的 `comparison`、JSON 与 Markdown 路径），不再直接保存旧 `AnalysisReport`。`taie_analyze` 返回同一结构；`taie_get_finding` 可读取最新检查，首次模型提示时也可读取已采集的基线，默认查询项目告警，显式选择依赖归属且配置允许展示时才返回依赖详情。模型拿到的检查结果与最终宿主检查各自保留，宿主总会重新检查当前代码，不因模型工具刚报告通过就省略验收。
 
+显式 `/review` 的结果使用独立的复核协议；原 `check.json` 的 `stages.review: not_run` 描述检查当时的状态，之后不会被复核记录覆盖。模型建议不能将 `unresolved` 或 `check_failed` 转成 `verified`。
+
 | `outcome` | 含义 |
 | --- | --- |
-| `verified` | 新的宿主构建、实际测试和分析均通过，项目零告警；误报复核仍未运行 |
+| `verified` | 新的宿主构建、实际测试和分析均通过，项目零告警，已配置的独立业务验收通过 |
 | `skipped` | 本轮按显式选项或会话默认值跳过 Tai-e，任务正常完成 |
-| `unresolved` | 保留了告警，例如关闭修复、拒绝修复或用尽预算 |
+| `unresolved` | 仍有项目告警或业务断言失败，例如关闭修复、拒绝修复或用尽预算 |
 | `incomplete` | 项目测试未运行，例如 javac 编译和分析成功且项目零告警 |
-| `check_failed` | 构建或测试失败未解决、分析失败、后端错误、超时或结果过期；具体原因见最后一次 check |
+| `check_failed` | 构建或测试失败未解决、分析失败、验收运行器错误、后端错误、超时或结果过期 |
 | `agent_error` | 模型调用、任务预算或其他 agent 执行错误 |
 
 `verified` 和 `skipped` 的 CLI 退出码均为 `0`，其余为 `1`。自动化调用需要检查 `outcome`；`skipped` 没有通过静态检查，记录的 `checks` 为空、`repairRounds` 为 `0`。关闭修复或拒绝修复不会删除原始告警与证据。
@@ -231,6 +268,7 @@ npm run test:host
 npm run test:baseline
 npm run test:live:policy
 npm run test:live:maven
+npm run test:live:review
 ```
 
 `test:host` 包含本地宿主、修复权限、配置面板和真实 CLI 子进程测试，不请求模型或运行 Java。`test:live:policy` 调用环境中的 DeepSeek API，使用私有合成示例验证 off、ask 拒绝、ask 同意三个阶段，并独立编译执行 Java 断言；会产生 API 用量。
@@ -238,3 +276,5 @@ npm run test:live:maven
 `test:baseline` 运行真实 Java/Tai-e，用脚本确定性修改示例并核验修改前后的告警比较；不调用模型 API，不将脚本修改当作真实模型修复能力的证据。
 
 `test:live:maven` 在项目副本中调用真实模型和 Maven 容器，先验证测试失败不能因零静态告警放行，再由测试程序批准一次修复并核验新的构建、测试和分析结果。默认总预算 900000 毫秒，可通过 `TAIE_SMOKE_TIMEOUT_MS` 调整；只使用已有离线依赖缓存。
+
+`test:live:review` 运行真实 Java/Tai-e 并请求一次模型复核，会产生 API 用量；它验证基本复核链路，不替代误报识别 benchmark 或完整污点证据验收。

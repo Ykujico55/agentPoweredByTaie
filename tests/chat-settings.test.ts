@@ -13,7 +13,7 @@ function settings(): ChatSettings {
 }
 
 test('the settings registry covers every configurable CLI setting exactly once', () => {
-  const keys = ['project', 'build-backend', 'dependency-network', 'baseline', 'include-dependencies', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
+  const keys = ['project', 'build-backend', 'acceptance-java', 'dependency-network', 'baseline', 'include-dependencies', 'provider', 'model', 'repair-mode', 'analysis', 'max-repairs', 'max-turns',
     'timeout', 'analysis-timeout', 'analyses', 'source-root', 'classpath', 'main-class', 'taint-config',
     'taint-implicit-entries', 'java-version', 'jar', 'json'];
   assert.deepEqual(CHAT_SETTING_REGISTRY.map(entry => entry.key), keys);
@@ -93,6 +93,9 @@ test('interactive project paths resolve against the current project and optional
   const before = settings();
   const project = applySetting(before, 'project', '"../project with spaces"');
   assert.equal(project.projectDir, path.resolve(before.projectDir, '../project with spaces'));
+  const acceptance = applySetting(project, 'acceptance-java', '"../business tests/Verifier.java"');
+  assert.equal(acceptance.acceptanceJava, path.resolve(project.projectDir, '../business tests/Verifier.java'));
+  assert.equal(applySetting(acceptance, 'acceptance-java', 'unset').acceptanceJava, undefined);
   const jar = applySetting(project, 'jar', '"tools/custom jar.jar"');
   assert.equal(jar.config.jarPath, path.resolve(project.projectDir, 'tools/custom jar.jar'));
   const taint = applySetting(project, 'taint-config', 'policies/taint.yml');
@@ -165,6 +168,7 @@ test('chat command parsing preserves task text and JSON arguments and maps alias
   assert.deepEqual(parseChatCommand('/settings'), { kind: 'settings' });
   assert.deepEqual(parseChatCommand('/help'), { kind: 'help' });
   assert.deepEqual(parseChatCommand(' /check '), { kind: 'check' });
+  assert.deepEqual(parseChatCommand(' /review finding-123 '), { kind: 'review', findingId: 'finding-123' });
   assert.deepEqual(parseChatCommand('/exit'), { kind: 'exit' });
   assert.deepEqual(parseChatCommand('/set --model another-model'), { kind: 'set', key: 'model', value: 'another-model' });
   assert.deepEqual(parseChatCommand('/set classpath ["D:/Java libs/a,b.jar", "lib/c.jar"]'), {
@@ -175,7 +179,7 @@ test('chat command parsing preserves task text and JSON arguments and maps alias
   assert.deepEqual(parseChatCommand('/analysis off'), { kind: 'set', key: 'analysis', value: 'off' });
   assert.deepEqual(parseChatCommand('  Write Java code.  '), { kind: 'message', text: '  Write Java code.  ' });
   assert.deepEqual(parseChatCommand('--skip-taie 先讨论设计'), { kind: 'message', text: '--skip-taie 先讨论设计' });
-  for (const input of ['/unknown', '/set', '/set model', '/set unknown value', '/repair', '/repair yes', '/analysis', '/analysis maybe', '/config extra', '/check extra', '/exit now'])
+  for (const input of ['/unknown', '/set', '/set model', '/set unknown value', '/repair', '/repair yes', '/analysis', '/analysis maybe', '/config extra', '/check extra', '/review', '/review id other', '/review id\0', '/exit now'])
     assert.throws(() => parseChatCommand(input), Error, input);
 });
 

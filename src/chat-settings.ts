@@ -5,6 +5,7 @@ import { DEFAULT_ANALYSES, SUPPORTED_ANALYSES, getDefaultJarPath } from './taie.
 
 export interface ChatSettings {
   projectDir: string;
+  acceptanceJava?: string;
   config: ProjectConfig;
   provider: string;
   model: string;
@@ -104,6 +105,8 @@ export const CHAT_SETTING_REGISTRY: readonly ChatSettingDefinition[] = [
       if (value !== 'javac' && value !== 'maven-docker') throw new Error('构建后端必须使用 javac 或 maven-docker。');
       settings.config.buildBackend = value;
     }),
+  definition('acceptance-java', 'Maven 编码任务使用的 Java 业务验收文件；unset 清除', '<文件>|unset', settings => optionalPath(settings.acceptanceJava, settings.projectDir),
+    (settings, raw) => { if (unset(raw)) delete settings.acceptanceJava; else settings.acceptanceJava = resolve(settings.projectDir, scalar(raw)); }),
   definition('dependency-network', 'Maven 依赖准备阶段联网；检查阶段始终离线', 'on|off', settings => settings.config.dependencyNetwork ? 'on' : 'off',
     (settings, raw) => { settings.config.dependencyNetwork = boolean(raw); }),
   definition('baseline', '模型任务开始前记录基线；默认 on，每轮增加一次检查', 'on|off', settings => settings.config.baselineEnabled === false ? 'off' : 'on',
@@ -193,13 +196,14 @@ export function renderSettings(current: ChatSettings): string {
     '会话配置（/set <设置名> <值>）',
     ...CHAT_SETTING_REGISTRY.map(entry => `${entry.flag.padEnd(26)} ${entry.display(current)}\n  ${entry.description}；${entry.usage}`),
     '',
-    '相对路径：project 相对当前项目目录；jar、taint-config、source-root、classpath 相对所选项目。',
+    '相对路径：project 相对当前项目目录；acceptance-java、jar、taint-config、source-root、classpath 相对所选项目。',
     'source-root auto 清除显式目录，下一轮重新推断。改变设置是否重建会话由 CLI 提示。',
     'Maven 从构建结果取得 source-root 和 classpath，不接受手动覆盖；可将二者设为 auto。',
     '/check 按 build-backend 执行检查，不调用模型或自动修复；/analysis off 不会禁用显式 /check。',
+    '/review <告警ID> 使用当前模型只读复核最近检查的项目告警；不重新检测、不修复、不关闭告警。',
     'baseline 控制模型修改前的基线检查，关闭后仍执行最终验收；--skip-taie 同时跳过基线和验收。',
     '模型工具、宿主验收和 /check 使用同一后端；Maven 后端不可用时不回退到宿主 javac。',
-    'verified 要求构建、实际测试、分析通过且无项目告警；javac 未运行测试，干净结果为 incomplete。',
+    'verified 要求构建、实际测试、分析通过且无项目告警；配置的业务验收也须通过。javac 未运行测试，干净结果为 incomplete。',
     'Maven 构建/测试/分析在容器中执行；模型的 shell 和文件工具仍在宿主执行。',
     '含逗号或空格的多个路径请使用 JSON 数组，Windows 路径可用 / 或 JSON 双反斜杠。',
     `Java 环境（只读）：${javaHome ? `${process.env.TAIE_JAVA_HOME ? 'TAIE_JAVA_HOME' : 'JAVA_HOME'}=${javaHome}` : 'PATH 中的 java / javac'}`,
@@ -209,6 +213,7 @@ export function renderSettings(current: ChatSettings): string {
     '  /set build-backend maven-docker',
     '  /set dependency-network on',
     '  /check',
+    '  /review <告警ID>  调用模型给出建议，人工处置仍待定',
     '  /set source-root ["src/main/java", "generated sources"]',
     '  /set classpath ["lib/dependency,one.jar", "D:/Java libraries/two.jar"]',
     '  /set jar vendor/Tai-e/build/tai-e-all-0.5.4.jar',
@@ -222,6 +227,7 @@ export function renderSettings(current: ChatSettings): string {
 export type ChatCommand =
   | { kind: 'settings' }
   | { kind: 'check' }
+  | { kind: 'review'; findingId: string }
   | { kind: 'set'; key: string; value: string }
   | { kind: 'help' }
   | { kind: 'exit' }
@@ -235,6 +241,10 @@ export function parseChatCommand(text: string): ChatCommand {
   if (!match) throw new Error('无效命令。输入 /help 查看用法。');
   const command = match[1];
   const argumentsText = match[2]?.trim() ?? '';
+  if (command === '/review') {
+    if (!argumentsText || /\s|\0/.test(argumentsText)) throw new Error('用法：/review <单个项目告警ID>；先运行 /check。');
+    return { kind: 'review', findingId: argumentsText };
+  }
   if (['/config', '/settings', '/check', '/help', '/exit'].includes(command)) {
     if (argumentsText) throw new Error(`${command} 不接受参数。`);
     return { kind: command === '/config' || command === '/settings' ? 'settings' : command === '/check' ? 'check' : command === '/help' ? 'help' : 'exit' };

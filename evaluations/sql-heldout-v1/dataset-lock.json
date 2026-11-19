@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "frozenAt": "2026-11-03T11:57:00.987Z",
+  "fixtureHashes": {
+    "tests/fixtures/sql-heldout/oracle.json": "d9b52015c1452f11c23df3b8615c5cef4d1037a639b3dfa5d67378ca89d9efc0",
+    "tests/fixtures/sql-heldout/pom.xml": "7c4868ae6b176ada18c658bb8621a6dfe3b21e1b2a999dfecd98c51ed398292f",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseG.java": "635b5a4a616fc20e00391423510048de6f0fd7732fcfc548e8fc084334f0cb9c",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseH.java": "c0cb3f284e907577663d1d0f7f044ab814d94e88ccaa48db9157c5cf3ef24b16",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseI.java": "66b1f8cb1ce61a8abf35eaf02e27ee4dceffbf8459a97c487d296a26b4bfa35b",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseJ.java": "ee1133cf5e4e58afa5961cdeeb97f93bf452c6f787f221054434d2cf30f5d23f",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseK.java": "802a89a831c0bb8f083b6e903a22ac8464799a4092de720a4523cbd5c468b1bd",
+    "tests/fixtures/sql-heldout/src/main/java/example/CaseL.java": "e040c309237c2fcc4e351bb4e6ceb0be67dbac7e9cdc2539265452e1155ae633",
+    "tests/fixtures/sql-heldout/src/main/java/example/Main.java": "bf7392e5892bdb970fedeecafb0ebdedeab5e524c1ea442d8fdc483c755cfd7f",
+    "tests/fixtures/sql-heldout/src/test/java/example/QueryBehaviorTest.java": "89a480cfc7de1f4c3eed64ebeecf763f3bd42fd616e805987adfa29c03d3992d",
+    "tests/fixtures/sql-heldout/taie-agent.json": "c0420f52eb468f19c04b5998b7cf8f816361b9436f97d1aba51f94a60fe9b87b",
+    "tests/fixtures/sql-heldout/taint.yml": "6b501279bdb5971fd04eca368cf226e51d9e120a0237d92fed3db7186353e3a4"
+  },
+  "runnerHashes": {
+    "scripts/probe-sql-heldout.ts": "ff106ab0b217d7af67663c3f9873af7394bd6f4f9fc454d3e88d8e91b31962c5",
+    "scripts/review-sql-heldout.ts": "e62aec16b70ef221c1fd98183a6e313a0826b7d9701e9a8b1d08f11f5af56b69",
+    "scripts/score-sql-heldout.ts": "0d3faacf5d848830bc19c1dcaa83e5926b6793621c2eccbbb80b8fc7713478dd",
+    "evaluations/sql-heldout-v1/rubric.md": "7587753b1e66c7b652a76457d24a4c4147e6089a366922948e288ecabdae9070"
+  },
+  "oracleSha256": "d9b52015c1452f11c23df3b8615c5cef4d1037a639b3dfa5d67378ca89d9efc0",
+  "note": "Dataset, investigator oracle, runners and scoring rubric fixed before any held-out model response. No prompt or code tuning on responses."
+}

@@ -6,6 +6,7 @@ import { stdin, stdout, stderr } from "node:process";
 import { freezeProjectConfig, loadProjectConfig } from "./config.ts";
 import { analyzeJavaProject, getDefaultJarPath } from "./taie.ts";
 import { renderCheckResult, type CheckResult } from "./check.ts";
+import { loadJavaAcceptance } from "./business-acceptance.ts";
 import { parseChatTurn } from "./turn.ts";
 import type { RepairMode } from "./verification.ts";
 import { applySetting, parseChatCommand, renderSettings, CHAT_SETTING_REGISTRY, type ChatSettings } from "./chat-settings.ts";
@@ -17,6 +18,7 @@ const help = [
   "Usage:",
   '  npm start -- run --project <dir> --prompt "Write a Java program ..."',
   "  npm start -- chat --project <dir>",
+  "  npm start -- review --project <dir> --report <check.json> --finding <id>",
   "  npm run analyze -- --project <dir>",
   "  npm run check:maven -- --project <dir> --dependency-network on",
   "  npm run build:maven-image  Build the fixed JDK 17/Maven container image",
@@ -29,6 +31,8 @@ const help = [
   "Launch / per-message options:",
   "  --prompt <text>         Initial task (or positional text after run)",
   "  --prompt-file <file>    Initial task from a UTF-8 file",
+  "  --report <check.json>   Saved unified check to review (review only; relative to launch directory)",
+  "  --finding <id>         Single project finding to review (review only)",
   "  --skip-taie            Skip Tai-e for this run (chat: first message only)",
   "  --no-repair            Disable repairs for this run (chat: first message only)",
   "  --json                 Print task results as JSON; local UI uses stderr",
@@ -37,7 +41,7 @@ const help = [
   "CLI defaults: analysis=on, repair-mode=ask, max-repairs=2, max-turns=30, timeout=600000ms.",
   "Task timeout excludes time waiting for human repair decisions.",
   "--source-root and --classpath are repeatable launch flags.",
-  "--jar / --taint-config launch paths are relative to the launch directory.",
+  "--jar / --taint-config / --acceptance-java launch paths are relative to the launch directory.",
   "",
   "Chat commands (handled by host, no model request):",
   "  /config or /settings   Show all settings and effective values",
@@ -48,6 +52,9 @@ const help = [
   "  /help                 Show this help",
   "  /exit                 Exit",
   "",
+  "Chat model command (read-only, separate from coding and repair):",
+  "  /review <id>          Review one project finding from the latest /check or final host check",
+  "",
   "Prefix one chat message with --no-repair or --skip-taie for a one-message override.",
   "ask requires y/yes to start each repair round; empty input/EOF means no.",
   "In JSON mode ask preserves findings without an interactive repair prompt.",
@@ -55,12 +62,15 @@ const help = [
   "Configure source roots/dependencies in <project>/taie-agent.json.",
   "Credentials are needed only for model tasks, not local configuration commands.",
   "/check runs even when /analysis is off, and does not consume per-message overrides.",
+  "/review uses provider/model/timeout, requests the model, and does not consume per-message overrides.",
+  "Review completion (exit 0) means a suggestion was recorded, not that quality checks passed; findings remain open.",
   "build-backend selects the same backend for model tools, fresh host verification, and /check; default javac.",
   "Maven build/test/analysis runs in Docker; model shell/file tools still run on the host.",
   "dependency-network/include-dependencies apply to run/chat and check-maven; Maven checks stay offline.",
   "A clean javac /check is tests_not_run. Maven passed requires build, tests and analysis success; review remains not_run.",
   'Agent schemaVersion=2: "verified" requires fresh build, executed tests and analysis success with no project findings.',
-  'Clean javac tasks return "incomplete" (exit 1); failed checks return "check_failed". Review remains not_run.',
+  'With --acceptance-java, verified also requires the external Java acceptance assertions to pass on the same Maven build.',
+  'Before a repair round, the agent reviews project findings and passes located defects to the coding model. Clean javac tasks return "incomplete" (exit 1).',
   'baseline=on records a fresh check before each model task; --baseline off disables only this extra check.',
   'Baseline failures remain visible; finding differences never suppress existing findings or override test failures.',
   "",
@@ -81,12 +91,19 @@ async function main() {
       "dependency-network": { type: "string" },
       "include-dependencies": { type: "boolean" },
       "build-backend": { type: "string" },
+      "acceptance-java": { type: "string" },
       baseline: { type: "string" },
+      report: { type: "string" }, finding: { type: "string" },
     },
   });
   if (values.help) { console.log(help); return; }
   const command = positionals[0] ?? "chat";
-  if (!["run", "chat", "analyze", "doctor", "check-maven"].includes(command)) throw new Error("Unknown command " + command + ". Use --help.");
+  if (!["run", "chat", "analyze", "doctor", "check-maven", "review"].includes(command)) throw new Error("Unknown command " + command + ". Use --help.");
+  for (const flag of ['report', 'finding'] as const) {
+    if (values[flag] !== undefined && command !== 'review') throw new Error('--' + flag + ' applies only to review.');
+  }
+  if (command === 'review' && (!values.report?.trim() || !values.finding?.trim()))
+    throw new Error('review requires --report <check.json> and --finding <id>.');
   for (const flag of ['dependency-network', 'include-dependencies'] as const) {
     if (values[flag] !== undefined && !['run', 'chat', 'check-maven'].includes(command))
       throw new Error('--' + flag + ' applies only to run/chat or check-maven.');
@@ -96,7 +113,7 @@ async function main() {
   if (command === 'check-maven' && values['build-backend'] !== undefined && values['build-backend'] !== 'maven-docker')
     throw new Error('check-maven requires --build-backend maven-docker.');
   if (command !== "run" && command !== "chat") {
-    for (const flag of ["skip-taie", "no-repair", "repair-mode", "analysis", "baseline"] as const) {
+    for (const flag of ["skip-taie", "no-repair", "repair-mode", "analysis", "baseline", "acceptance-java"] as const) {
       if (values[flag] !== undefined) throw new Error("--" + flag + " applies only to run/chat, not analyze or doctor.");
     }
   }
@@ -136,8 +153,31 @@ async function main() {
     settings = applySetting(settings, 'include-dependencies', String(values['include-dependencies']));
   if (values.jar) settings = applySetting(settings, "jar", resolve(values.jar));
   if (values["taint-config"]) settings = applySetting(settings, "taint-config", resolve(values["taint-config"]));
+  if (values["acceptance-java"] !== undefined) settings = applySetting(settings, "acceptance-java",
+    values["acceptance-java"] === "unset" ? "unset" : resolve(values["acceptance-java"]));
   if (values["source-root"]) settings = applySetting(settings, "source-root", JSON.stringify(values["source-root"]));
   if (values.classpath) settings = applySetting(settings, "classpath", JSON.stringify(values.classpath));
+  let activeOperation: AbortController | undefined;
+  const review = async (reportPath: string, findingId: string) => {
+    await access(reportPath);
+    const { reviewFinding, renderReviewResult } = await import('./review.ts');
+    const controller = new AbortController();
+    activeOperation = controller;
+    const cancel = () => controller.abort();
+    process.once('SIGINT', cancel);
+    console.error('[复核] 调用模型只读复核单条项目告警；不修改代码或关闭告警。Ctrl+C 取消。');
+    try {
+      const result = await reviewFinding({ projectDir: settings.projectDir, reportPath, findingId,
+        provider: settings.provider, model: settings.model, timeoutMs: settings.timeoutMs, signal: controller.signal });
+      console.log(settings.json ? JSON.stringify(result, null, 2) : renderReviewResult(result));
+      console.error('[复核] 结果不改变原质检状态；所有告警保留，人工处置仍待定。');
+      process.exitCode = result.status === 'completed' ? 0 : 1;
+    } finally { activeOperation = undefined; process.removeListener('SIGINT', cancel); }
+  };
+  if (command === 'review') {
+    await review(resolve(values.report!), values.finding!.trim());
+    return;
+  }
   if (command === 'check-maven') {
     const { checkMavenInDocker } = await import('./docker-maven.ts');
     const controller = new AbortController();
@@ -165,15 +205,15 @@ async function main() {
   const task = values["prompt-file"] ? await readFile(resolve(values["prompt-file"]), "utf8") : values.prompt ?? positionals.slice(1).join(" ");
   if (command === "run" && !task.trim()) throw new Error("run requires --prompt, --prompt-file or a positional task.");
   let input: ConsoleInput | undefined;
-  let activeCheck: AbortController | undefined;
   if (command === "chat" || (settings.repairMode === "ask" && !settings.json)) input = createConsoleInput(stdin, stderr, () => {
-    if (!activeCheck) return false;
-    activeCheck.abort();
-    console.error('[检查] 已请求取消，正在保存证据并清理。');
+    if (!activeOperation) return false;
+    activeOperation.abort();
+    console.error('[任务/检查/复核] 已请求取消，正在保存证据并清理。');
     return true;
   });
   let agent: Awaited<ReturnType<typeof import("./agent.ts")["createTaieAgent"]>> | undefined;
   let appliedSettings: string | undefined;
+  let latestCheckPath: string | undefined;
   let frozenAgentConfig: typeof settings.config | undefined;
   let frozenConfigKey: string | undefined;
   let agentSourceRoots: string[] | undefined;
@@ -187,11 +227,13 @@ async function main() {
     console.error("启动输入：--prompt " + (values.prompt === undefined ? "未设置" : "已设置") + "；--prompt-file " + (values["prompt-file"] ?? "未设置") + "（仅启动时读取）。");
     if (skipNextTurn || repairNextTurn) console.error("下一条任务覆盖：" + (skipNextTurn ? "跳过检测 " : "") + (repairNextTurn ? "不修复" : ""));
   };
-  const confirmRepair = async (report: CheckResult, round: number) => {
+  const confirmRepair = async (report: CheckResult, round: number, targets: CheckResult['findings'], businessFailures?: string[]) => {
     if (settings.json || !input) return false;
-    console.error("\n[修复选择] 第 " + round + "/" + settings.maxRepairs + " 轮 · " + report.status + " · " + report.findings.length + " 条告警");
+    console.error("\n[修复选择] 第 " + round + "/" + settings.maxRepairs + " 轮 · 项目检查 " + report.status + " · " + report.findings.length + " 条告警");
     console.error('构建：' + report.stages.build + '；测试：' + report.stages.test.status + '（失败 ' + report.stages.test.failures + '，错误 ' + report.stages.test.errors + '）；分析：' + report.stages.analysis);
-    for (const finding of report.findings.slice(0, 5)) console.error("  " + finding.type + ": " + (finding.className ?? "") + (finding.startLine ? " 第 " + finding.startLine + " 行" : ""));
+    if (businessFailures) console.error('[业务验收] 未通过\n' + businessFailures.join('\n'));
+    if (report.findings.length) console.error("本轮已定位的修复目标：" + targets.length + " 条");
+    for (const finding of targets) console.error("  " + finding.id + " · " + finding.type + " · " + (finding.sourcePath ?? finding.method ?? finding.className ?? "") + (finding.startLine ? " 第 " + finding.startLine + " 行" : ""));
     if (report.diagnostics.length) console.error(report.diagnostics.join("\n").slice(-2000));
     console.error("质检报告：" + report.humanReportPath);
     console.error("JSON：" + report.reportPath);
@@ -202,7 +244,7 @@ async function main() {
       else console.error('基线对比不可用：' + (comparison.reason ?? comparison.status));
     }
     for (;;) {
-      const answer = await input.ask("是否允许修改代码并重新检测？[y/N] > ");
+      const answer = await input.ask("是否允许修改代码并重新检测？[y/N] > ", activeOperation?.signal);
       if (answer === undefined) return false;
       const choice = answer.trim().toLowerCase();
       if (["y", "yes", "是", "修复"].includes(choice)) return true;
@@ -210,7 +252,7 @@ async function main() {
       if (["/config", "/settings"].includes(choice)) { printSettings(); continue; }
       if (choice === "/help") { console.error(help); continue; }
       if (command === "chat") input.defer(answer);
-      console.error("[taie-agent] 未收到明确修复同意，保留告警。" + (command === "chat" ? "该输入将在下一轮处理。" : ""));
+      console.error("[taie-agent] 本轮不修复。" + (command === "chat" ? "该输入将在下一轮处理。" : ""));
       return false;
     }
   };
@@ -240,19 +282,46 @@ async function main() {
     return agent;
   };
   const execute = async (text: string, skipTaie = false, repairMode = settings.repairMode) => {
-    const report = await (await getAgent()).run(text, { skipTaie: skipTaie || !settings.analysisEnabled, repairMode });
+    const controller = new AbortController();
+    activeOperation = controller;
+    const cancel = () => controller.abort();
+    process.once('SIGINT', cancel);
+    let report: Awaited<ReturnType<NonNullable<typeof agent>['run']>>;
+    const skipCheck = skipTaie || !settings.analysisEnabled;
+    try {
+      let acceptBusiness;
+      if (settings.acceptanceJava && !skipCheck) {
+        if (settings.config.buildBackend !== 'maven-docker') throw new Error('Java 业务验收需要 --build-backend maven-docker。');
+        acceptBusiness = await loadJavaAcceptance(settings.acceptanceJava);
+      }
+      if (!settings.json) console.error('[任务] 正在准备模型会话 · ' + settings.provider + '/' + settings.model + '；Ctrl+C 取消。');
+      const currentAgent = await getAgent();
+      if (controller.signal.aborted) throw new Error('Agent task cancelled.');
+      report = await currentAgent.run(text, { skipTaie: skipCheck, repairMode, signal: controller.signal, acceptBusiness });
+    } finally { activeOperation = undefined; process.removeListener('SIGINT', cancel); }
+    const lastCheck = report.checks.at(-1);
+    const business = report.businessChecks?.find(entry => entry.checkReportPath === lastCheck?.reportPath);
     if (settings.json) console.log(JSON.stringify(report, null, 2));
     else {
       console.log("\n\n[taie-agent] " + report.outcome + "; repair: " + report.repairMode + "; host checks: " + report.checks.length + "; evidence: " + report.runDir);
       console.log('[基线] ' + report.baseline.status + (report.baseline.check ? ' · ' + report.baseline.check.status + ' · ' + report.baseline.check.humanReportPath : ''));
       if (report.error) console.error("[taie-agent] " + report.error);
-      else if (report.outcome === "unresolved") console.error("[taie-agent] 告警已保留。可用 /repair auto 或下一轮明确安排修复。");
+      else if (report.outcome === "unresolved" && !business) console.error("[taie-agent] 仍有项目告警，详见本轮质检报告和复核记录。");
       else if (report.outcome === "incomplete") console.error("[taie-agent] 检查未完成：项目测试未运行，不能视为通过。");
     }
-    const lastCheck = report.checks.at(-1);
     if (lastCheck) {
+      latestCheckPath = lastCheck.reportPath;
       if (settings.json) console.error('可读质检报告: ' + lastCheck.humanReportPath);
-      else console.log(renderCheckResult(lastCheck));
+      else {
+        if (settings.acceptanceJava) console.log('[项目构建、测试与静态检查]');
+        console.log(renderCheckResult(lastCheck));
+        if (settings.acceptanceJava) {
+          const status = business?.status === 'passed' ? '通过' : business?.status === 'failed' ? '未通过\n' + business.failures.join('\n')
+            : business?.status === 'error' ? '执行错误' : '未执行';
+          console.log('[业务验收] ' + status);
+          if (business && 'reportPath' in business && business.reportPath) console.log(business.reportPath);
+        }
+      }
     }
     process.exitCode = report.outcome === "verified" || report.outcome === "skipped" ? 0 : 1;
   };
@@ -262,6 +331,7 @@ async function main() {
     if (next.projectDir !== settings.projectDir) {
       await mkdir(next.projectDir, { recursive: true });
       const projectConfig = await loadProjectConfig(next.projectDir);
+      delete next.acceptanceJava;
       next.config = { ...projectConfig, jarPath: projectConfig.jarPath ?? settings.config.jarPath, analyses: projectConfig.analyses ?? settings.config.analyses };
       if (next.config.jarPath) next.config.jarPath = resolve(next.projectDir, next.config.jarPath);
       if (next.config.taintConfig) next.config.taintConfig = resolve(next.projectDir, next.config.taintConfig);
@@ -271,6 +341,7 @@ async function main() {
       frozenAgentConfig = undefined;
       frozenConfigKey = undefined;
       agentSourceRoots = undefined;
+      latestCheckPath = undefined;
       console.error("[taie-agent] 已切换项目并加载其配置；下一条任务开始新对话。模型、修复策略和预算保留。");
     }
     settings = next;
@@ -279,16 +350,17 @@ async function main() {
   const check = async () => {
     const { checkProject, renderCheckResult } = await import('./check.ts');
     const controller = new AbortController();
-    activeCheck = controller;
+    activeOperation = controller;
     const cancel = () => controller.abort();
     process.once('SIGINT', cancel);
     console.error('[检查] ' + (settings.config.buildBackend ?? 'javac') + ' · 构建/测试/分析中；不调用模型、不修复。Ctrl+C 取消。');
     try {
       const report = await checkProject({ ...settings.config, projectDir: settings.projectDir, signal: controller.signal });
+      latestCheckPath = report.reportPath;
       console.log(settings.json ? JSON.stringify(report, null, 2) : renderCheckResult(report));
       if (settings.json) console.error('可读质检报告: ' + report.humanReportPath);
       process.exitCode = report.status === 'passed' ? 0 : report.status === 'findings' ? 2 : 1;
-    } finally { activeCheck = undefined; process.removeListener('SIGINT', cancel); }
+    } finally { activeOperation = undefined; process.removeListener('SIGINT', cancel); }
   };
   const dispatch = async (text: string): Promise<boolean> => {
     try {
@@ -298,6 +370,11 @@ async function main() {
       if (action.kind === "help") { console.error(help); return true; }
       if (action.kind === "set") { await setValue(action.key, action.value); return true; }
       if (action.kind === "check") { await check(); return true; }
+      if (action.kind === 'review') {
+        if (!latestCheckPath) throw new Error('本会话还没有可复核的检查报告，请先运行 /check。');
+        await review(latestCheckPath, action.findingId);
+        return true;
+      }
       const turn = parseChatTurn(action.text, skipNextTurn, repairNextTurn);
       if (!turn.task.trim()) {
         skipNextTurn = turn.skipTaie;
@@ -316,7 +393,7 @@ async function main() {
   };
   try {
     if (command === "run") { await execute(task, skipNextTurn, repairNextTurn ?? settings.repairMode); return; }
-    console.error("Tai-e Coding Agent · " + settings.projectDir + "\n/config 查看配置；/check 手动检查；/repair 选择修复；/analysis 开关检测；/exit 退出。");
+    console.error("Tai-e Coding Agent · " + settings.projectDir + "\n/config 查看配置；/check 手动检查；/review <告警ID> 只读复核；/repair 选择修复；/analysis 开关检测；/exit 退出。");
     printSettings();
     if (task.trim() && !await dispatch(task)) return;
     for (;;) {

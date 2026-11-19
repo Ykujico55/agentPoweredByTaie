@@ -15,7 +15,7 @@ export function guardRepairTools(
     if (isLocked() && modifyingTools.has(context.toolCall.name)) {
       return {
         block: true,
-        reason: "Repair tools are locked after analysis. User authorization is required before modifying files or running shell commands.",
+        reason: "Repair tools are paused. Finish this response so the host can decide whether to start a repair round.",
       };
     }
     return previousHook?.(context, signal);

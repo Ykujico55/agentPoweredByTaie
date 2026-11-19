@@ -1,7 +1,11 @@
+import type { RepairMode, VerificationOptions } from "./verification.ts";
+
 /** Options are supplied for each user message and never become project configuration. */
 export interface AgentTurnOptions {
   skipTaie?: boolean;
   repairMode?: RepairMode;
+  signal?: AbortSignal;
+  acceptBusiness?: VerificationOptions["acceptBusiness"];
 }
 
 /** A leading chat flag applies only to this message; an empty task arms the next message. */
@@ -17,5 +21,4 @@ export function parseChatTurn(text: string, skipNextTurn = false, repairMode?: R
   }
   return { task, skipTaie, ...(repairMode === undefined ? {} : { repairMode }) };
 }
-import type { RepairMode } from "./verification.ts";
 

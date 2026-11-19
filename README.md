@@ -45,9 +45,11 @@ npm start -- chat --project examples/playground
 
 ## 在聊天中配置和修复
 
-启动 `chat` 会显示完整的 22 项设置面板，包括 CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改；`/help` 显示完整 CLI 帮助。
+启动 `chat` 会显示全部设置、CLI flag、当前有效值和绝对路径。聊天中使用 `/config` 或 `/settings` 再次查看，使用 `/set <设置名> <值>` 修改，`/help` 显示完整 CLI 帮助。
 
 手动 `/check` 无需模型、不会修复，输出构建/测试/分析/复核阶段及项目/依赖告警。用 `/set build-backend maven-docker` 为模型工具、宿主验收和手动检查选择 Maven，`/set dependency-network on` 显式允许依赖准备联网。javac 未运行测试，干净检查状态为 `tests_not_run`，模型任务最终结果为 `incomplete`。完整说明见 [交互配置](docs/interactive-settings.md)。
+
+Maven 编码任务可在 `run` 或 `chat` 启动时指定 `--acceptance-java <验收文件.java>`，也可在聊天中输入 `/set acceptance-java ../acceptance/Verifier.java`。每个启用检测的任务在模型写代码前固定验收文件内容。项目检查通过后，宿主用同一批构建产物执行验收。业务断言失败会按现有修复策略处理，修复后重新运行项目检查和业务验收。输入 `/set acceptance-java unset` 可清除该设置。输出约定与示例见 [交互配置](docs/interactive-settings.md#独立业务验收)。
 
 ```powershell
 npm start -- chat --project tests/fixtures/maven-simple --build-backend maven-docker --dependency-network off
@@ -58,6 +60,8 @@ npm start -- chat --project tests/fixtures/maven-simple --build-backend maven-do
 `/check` 和 `check-maven` CLI 每次都会同时生成中文 **`check.md` 质检报告**，包含结论、各阶段结果、告警详情和证据链接；命令行会显示其路径，现有 JSON 结果继续保留。
 
 模型任务的 `baseline` 默认 `on`，每轮额外执行一次真实检查，记录修改前状态；这部分耗时计入任务预算。启动时传 `--baseline off` 或聊天输入 `/set baseline off` 可以只关闭基线，仍保留模型工具和最终宿主验收。`--skip-taie` 同时跳过基线与最终检查；手动 `/check` 始终只检查一次。
+
+需要解释某条项目告警时，先从 `check.md` 或 `check.json` 取得 ID，再输入 `/review <告警ID>`。它使用当前模型对最近检查中记录的局部证据进行一次只读复核，另外生成 `review.json` 和中文 `review.md`。模型没有文件或 shell 工具，建议不会修改代码、关闭告警或改变质检状态；当前工作区未核验，输入变化后应重新 `/check`。复核只在显式调用时执行，会产生模型 API 用量。独立命令与证据限制见 [只读复核说明](docs/review.md)。
 
 ```text
 /config
@@ -157,14 +161,14 @@ agent 结果协议为 `schemaVersion: 2`，`baseline` 独立保存修改前检�
 
 | 值 | 含义 |
 | --- | --- |
-| `verified` | 最后一次新的构建、实际项目测试、分析均通过，且无项目告警 |
+| `verified` | 最后一次构建、实际项目测试、分析均通过，项目零告警，已配置的独立业务验收通过 |
 | `skipped` | 按本轮选项或会话默认值跳过 Tai-e，模型任务正常完成；没有执行宿主检查或修复循环 |
-| `unresolved` | 仍有告警，包括关闭修复、拒绝修复或修复预算用完的情况 |
+| `unresolved` | 仍有项目告警或业务断言失败，例如关闭修复、拒绝修复或用尽预算 |
 | `incomplete` | 未运行项目测试；例如 javac 编译与分析成功且无项目告警 |
-| `check_failed` | 构建或测试失败未解决，或分析/后端失败、超时、输入过期 |
+| `check_failed` | 构建或测试失败未解决，分析或验收运行器错误，后端失败、超时或输入过期 |
 | `agent_error` | 模型请求失败、任务超时或超过模型轮数预算 |
 
-`verified` 表示已配置的构建、项目测试和分析通过，不证明所有 bug 已排除，误报复核仍为 `not_run`。旧 `analysis_error` 已统一为 `check_failed`；旧 javac 干净任务现在返回 `incomplete`，退出码 1。默认任务超时 10 分钟，模型轮数上限 30，可通过 `--timeout` 和 `--max-turns` 调整。
+`verified` 表示已配置的构建、项目测试和分析通过，不证明所有 bug 已排除。检查报告中的复核阶段仍为 `not_run`；之后显式运行的单告警复核另存记录，不追溯改写原检查。旧 `analysis_error` 已统一为 `check_failed`；旧 javac 干净任务现在返回 `incomplete`，退出码 1。默认任务超时 10 分钟，模型轮数上限 30，可通过 `--timeout` 和 `--max-turns` 调整。
 
 `run` / `chat` 对 `verified` 和 `skipped` 返回退出码 `0`，其他结果返回 `1`。需要确认静态检查通过时，应检查 `outcome === "verified"`，不能只看进程退出码。
 
@@ -180,6 +184,10 @@ npm test
 npm run test:baseline
 npm run test:live
 npm run test:live:maven
+npm run test:live:review
+npm run test:sql -- --prepare-dependencies
+# 使用上一条命令输出的 result.json 路径：
+npm run test:sql:review -- ".taie-agent/sql-probe/运行ID/result.json" --suite v2
 ```
 
 普通测试不请求模型，包含真实 `javac`/Tai-e 集成检查和宿主复查逻辑测试。`test:live` 使用环境中的 API key 请求模型，会产生正常 API 用量；脚本检查实际写入的 Java 文件、`taie_analyze` 工具调用、宿主分析证据，并独立编译和执行 Java 断言。证据保存在本仓库 `.taie-agent/live-smoke/`。
@@ -188,10 +196,23 @@ npm run test:live:maven
 
 `test:live:maven` 使用离线 Maven 缓存与真实模型，验证“模型写入错误实现 → 测试失败但项目零静态告警 → 确认修复 → 模型修复 → 新的宿主检查通过”；测试同时确认 POM 和既有测试未被修改。javac 系列 live 脚本保留独立运行断言，但不把独立断言结果伪装成 agent 已执行的项目测试。
 
+`test:live:review` 运行真实 Java/Tai-e 检查，再发起一次真实模型复核，检查建议与证据文件；会产生 API 用量。执行结果以 [验证记录](docs/validation.md) 为准，命令存在不代表误报识别能力已通过 benchmark。
+
+`test:sql` 使用真实 JDBC/H2、JUnit 和 Tai-e，建立六个 SQL 案例的独立依据与实际告警矩阵，不调用模型。`test:sql:review` 读取该次运行的固定快照，分别复核真告警、误报告警和缺少关键实现的证据视图；默认 `--suite v2` 请求 DeepSeek 七次，记录提示版本并保存完整交互，不关闭告警。旧四案例报告须用 `--suite v1` 选择原三个视图，它仍使用当前提示。详见 [SQL 能力探针](docs/sql-probe.md)。这是开发用小样本验证，尚未集成到聊天中的扩展取证。
+
+[Held-out 验证](docs/sql-heldout.md) 使用另六个新案例，冻结 v2 提示及复核实现，分别统计分类和解释事实。`test:sql:heldout` 运行真实构建/SQL/Tai-e；`test:sql:heldout:review -- <结果路径>` 对实际告警逐条请求模型；`test:sql:heldout:score -- <复核结果路径> <事实核对路径>` 从另存的逐项核对记录生成评分。事实核对为待人工复验的 agent-assisted 记录，不自动关闭告警，也未接入日常 `/review` 自动取证。
+
+用户委托的六例 AI 标注现已完成。新增 `test:sql:regression -- <历史分析结果路径>`，在独立冻结的 v3 实验配置下复用相同证据；运行会调用真实模型。首次回归分类 6/6、整份解释事实全对 1/6，未通过质量门槛，日常版本保持不变。[复核与 v3 结果](docs/sql-regression-v3.md)。
+
+[源码引用实验](docs/source-citations.md) 由宿主给历史源码片段编号，模型按解释项选择编号，中文报告自动展开文件、行范围和原文。`test:sql:citations -- <历史分析结果路径> <G|H|I|J|K|L>` 发起一次真实请求；引用匹配与语义正确性分开记录，暂不接入日常 `/review`。
+
+[单方法执行顺序实验](docs/control-flow-review.md) 用真实 Tai-e CFG 核对模型提交的完整语句序列。`test:cfg -- <历史分析结果路径>` 导出 Case J 并检查正确/错误序列；`test:cfg:review -- <控制流探针结果路径>` 发起一次真实模型请求并生成报告。结构连通、条件可满足性和值流分别记录。
+
 ## 代码入口
 
-- `src/cli.ts`：`run`、`chat`、`analyze`、`doctor` 命令。
+- `src/cli.ts`：`run`、`chat`、`analyze`、`check-maven`、`review`、`doctor` 命令。
 - `src/agent.ts`：Pi SDK 会话、自定义分析工具和运行证据。
+- `src/review.ts`：单告警只读复核建议、输入版本绑定及独立报告。
 - `src/verification.ts`：由宿主控制的有界复查和修复循环。
 - `src/taie.ts`：Java 编译、真实 Tai-e 分析和结构化结果。
 - `scripts/setup-taie.mjs`：固定版本下载与 SHA-256 校验。

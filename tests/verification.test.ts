@@ -2,9 +2,26 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { formatReport, isCheckPassed, isRepairableCheck, verifyTask as runVerification, type VerificationOptions } from "../src/verification.ts";
 import type { CheckResult } from "../src/check.ts";
+import type { ReviewResult } from "../src/review.ts";
 
-// These existing cases exercise post-task verification independently of the baseline.
-const verifyTask = (options: VerificationOptions) => runVerification({ baselineEnabled: false, ...options });
+function locatedReview(check: CheckResult, finding: CheckResult["findings"][number]): ReviewResult {
+  const runDir = check.runDir + "/review/" + finding.id;
+  return {
+    schemaVersion: 1, status: "completed", startedAt: "2026-11-18T00:00:00Z",
+    projectDir: check.projectDir, runDir, reportPath: runDir + "/review.json", humanReportPath: runDir + "/review.md",
+    input: { reportPath: check.reportPath, reportSha256: "check-hash", findingId: finding.id, evidenceSha256: "evidence-hash" },
+    applicability: "recorded_input_only", currentWorkspace: "not_checked", disposition: "pending_human",
+    evidenceLevel: "E1_model_explanation", affectsCheckStatus: false, provider: "test", model: "test",
+    diagnostics: [], limitations: [],
+    suggestion: { findingId: finding.id, assessment: "true_positive", ruleClaim: "Result is discarded",
+      rationale: "The normalized value is discarded before returning.", evidenceRefs: ["finding"],
+      coverage: "whole_finding", assumptions: [], missingEvidence: [] },
+  };
+}
+
+const verifyTask = (options: VerificationOptions) => runVerification({
+  baselineEnabled: false, reviewFinding: async (check, finding) => locatedReview(check, finding), ...options,
+});
 
 function report(status: CheckResult["status"], hasFinding = false): CheckResult {
   return {
@@ -21,7 +38,8 @@ function report(status: CheckResult["status"], hasFinding = false): CheckResult 
       analysis: status === "build_failed" ? "not_run" : status === "analysis_failed" ? "failed" : "completed",
       review: "not_run",
     },
-    findings: hasFinding ? [{ id: "project-finding", origin: "project", analysis: "dead-code", type: "TEST_DEFECT", message: "Test defect evidence" }] : [],
+    findings: hasFinding ? [{ id: "project-finding", origin: "project", analysis: "dead-code", type: "TEST_DEFECT",
+      sourcePath: "src/Example.java", startLine: 12, snippet: "name.trim();", message: "Test defect evidence" }] : [],
     findingCounts: { project: hasFinding ? 1 : 0, dependency: 0, total: hasFinding ? 1 : 0 },
   };
 }
@@ -47,14 +65,101 @@ test("the default baseline is captured before the original task and stays separa
       assert.deepEqual(value, { status: "completed", check: baseline });
       order.push("baseline callback");
     },
+    onStatus: text => { order.push(text); },
     prompt: async text => { assert.equal(text, "Implement the requested feature"); order.push("model"); },
     onCheck: value => { assert.equal(value, final); order.push("check callback"); },
     confirmRepair: async () => { assert.fail("Pre-existing findings do not authorize a repair before the original task"); },
   });
-  assert.deepEqual(order, ["baseline", "baseline callback", "model", "final", "check callback"]);
+  assert.deepEqual(order, ["正在记录基线（构建/测试/分析）。", "baseline", "baseline callback", "正在等待模型回复。", "model", "正在执行最终检查（构建/测试/分析）。", "final", "check callback"]);
   assert.equal(result.outcome, "verified");
   assert.deepEqual(result.baseline, { status: "completed", check: baseline });
   assert.deepEqual(result.checks, [final]);
+  assert.equal(result.repairRounds, 0);
+});
+
+test("an already cancelled task starts neither a baseline nor a model request", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runVerification({
+    task: "Write code", maxRepairs: 1, signal: controller.signal,
+    prompt: async () => { assert.fail("Cancelled tasks must not prompt"); },
+    analyze: async () => { assert.fail("Cancelled tasks must not analyze"); },
+  });
+  assert.equal(result.schemaVersion, 2);
+  assert.equal(result.outcome, "agent_error");
+  assert.equal(result.error, "Agent task cancelled.");
+  assert.deepEqual(result.checks, []);
+});
+
+test("cancelling during the baseline preserves its report without starting the model", async () => {
+  const controller = new AbortController();
+  const baseline = report("findings", true);
+  let captured: CheckResult | undefined;
+  const result = await runVerification({
+    task: "Write code", maxRepairs: 1, signal: controller.signal,
+    analyze: async () => { controller.abort(); return baseline; },
+    onBaseline: value => { captured = value.check; },
+    prompt: async () => { assert.fail("Cancellation after baseline must not prompt"); },
+  });
+  assert.equal(result.outcome, "agent_error");
+  assert.equal(result.error, "Agent task cancelled.");
+  assert.equal(result.baseline.check, baseline);
+  assert.equal(captured, baseline);
+  assert.deepEqual(result.checks, []);
+  assert.equal(result.repairRounds, 0);
+});
+
+test("cancelling the model stops before host verification, including when the model throws", async () => {
+  for (const throws of [false, true]) {
+    const controller = new AbortController();
+    const result = await verifyTask({
+      task: "Write code", maxRepairs: 1, signal: controller.signal,
+      prompt: async () => { controller.abort(); if (throws) throw new Error("Request aborted"); },
+      analyze: async () => { assert.fail("Cancellation after model must not start another check"); },
+    });
+    assert.equal(result.outcome, "agent_error");
+    assert.equal(result.error, "Agent task cancelled.");
+    assert.deepEqual(result.checks, []);
+    assert.equal(result.repairRounds, 0);
+  }
+});
+
+test("cancelling a final check preserves evidence without passing or requesting repair", async () => {
+  for (const status of ["passed", "findings"] as const) {
+    const controller = new AbortController();
+    const original = report(status, status === "findings");
+    let prompts = 0;
+    let captured: CheckResult | undefined;
+    const result = await verifyTask({
+      task: "Write code", maxRepairs: 1, repairMode: "ask", signal: controller.signal,
+      prompt: async () => { prompts++; },
+      analyze: async () => { controller.abort(); return original; },
+      onCheck: value => { captured = value; },
+      confirmRepair: async () => { assert.fail("Cancelled tasks must not request a repair"); },
+    });
+    assert.equal(result.outcome, "agent_error");
+    assert.equal(result.error, "Agent task cancelled.");
+    assert.deepEqual(result.checks, [original]);
+    assert.equal(captured, original);
+    assert.equal(prompts, 1);
+    assert.equal(result.repairRounds, 0);
+  }
+});
+
+test("cancelling while approving a repair keeps the report without spending a repair round", async () => {
+  const controller = new AbortController();
+  const original = report("findings", true);
+  let prompts = 0;
+  const result = await verifyTask({
+    task: "Write code", maxRepairs: 1, repairMode: "ask", signal: controller.signal,
+    prompt: async () => { prompts++; },
+    analyze: async () => original,
+    confirmRepair: async () => { controller.abort(); return true; },
+  });
+  assert.equal(result.outcome, "agent_error");
+  assert.equal(result.error, "Agent task cancelled.");
+  assert.deepEqual(result.checks, [original]);
+  assert.equal(prompts, 1);
   assert.equal(result.repairRounds, 0);
 });
 
@@ -110,6 +215,7 @@ test("all post-task checks receive the original baseline across authorized repai
   let baselineCallbacks = 0;
   const result = await runVerification({
     task: "Add the feature", maxRepairs: 2, repairMode: "ask",
+    reviewFinding: async (check, finding) => locatedReview(check, finding),
     analyze: async previous => { comparisons.push(previous); return reports[comparisons.length - 1]; },
     onBaseline: value => { baselineCallbacks++; assert.equal(value.status, "completed"); },
     prompt: async () => {},
@@ -154,19 +260,114 @@ test("the host analyzes after the model finishes without calling any tools", asy
   assert.equal(result.outcome, "verified");
 });
 
-test("findings are sent back with evidence and the repaired code receives a fresh host check", async () => {
+test("business assertions gate verification and hand only the failed behavior to an approved repair", async () => {
+  const first = report("passed");
+  const second = { ...report("passed"), reportPath: "/test-project/fixed/check.json" };
+  const checks = [first, second];
+  const inspected: CheckResult[] = [];
   const prompts: string[] = [];
-  let scans = 0;
+  const failure = "empty order shipping: expected 0, got 600";
+  const evidence = "/independent/acceptance-output.txt";
   const result = await verifyTask({
-    task: "Fix code", maxRepairs: 2,
+    task: "Price an order", maxRepairs: 1, repairMode: "ask",
     prompt: async text => { prompts.push(text); },
-    analyze: async () => report("passed", scans++ === 0),
+    analyze: async () => checks.shift()!,
+    acceptBusiness: async check => {
+      inspected.push(check);
+      return check === first ? { status: "failed", failures: [failure], reportPath: evidence } : { status: "passed" };
+    },
+    confirmRepair: async (check, round, findings, failures) => {
+      assert.equal(check, first);
+      assert.equal(round, 1);
+      assert.deepEqual(findings, []);
+      assert.deepEqual(failures, [failure]);
+      return true;
+    },
   });
   assert.equal(result.outcome, "verified");
   assert.equal(result.repairRounds, 1);
-  assert.equal(scans, 2);
-  assert.match(prompts[1], /TEST_DEFECT/);
-  assert.match(prompts[1], /report\.json/);
+  assert.deepEqual(inspected, [first, second]);
+  assert.deepEqual(result.businessChecks, [
+    { checkReportPath: first.reportPath, status: "failed", failures: [failure], reportPath: evidence },
+    { checkReportPath: second.reportPath, status: "passed" },
+  ]);
+  assert.ok(prompts[1].includes(failure));
+  assert.ok(!prompts[1].includes(evidence));
+});
+
+test("a failed business assertion blocks a mechanically clean task even with repairs off", async () => {
+  const result = await verifyTask({
+    task: "Price an order", maxRepairs: 1, repairMode: "off",
+    prompt: async () => {}, analyze: async () => report("passed"),
+    acceptBusiness: async () => ({ status: "failed", failures: ["empty order charged shipping"] }),
+  });
+  assert.equal(result.outcome, "unresolved");
+  assert.equal(result.repairRounds, 0);
+});
+
+test("an unavailable independent runner fails the check without spending a repair round", async () => {
+  const result = await verifyTask({
+    task: "Price an order", maxRepairs: 1,
+    prompt: async () => {}, analyze: async () => report("passed"),
+    acceptBusiness: async () => { throw new Error("runner unavailable"); },
+  });
+  assert.equal(result.outcome, "check_failed");
+  assert.equal(result.repairRounds, 0);
+  assert.equal(result.businessChecks?.[0].status, "error");
+  assert.match(result.error ?? "", /runner unavailable/);
+});
+
+test("a reviewed location and its rationale reach the repair before a fresh passing check", async () => {
+  const prompts: string[] = [];
+  const order: string[] = [];
+  let scans = 0;
+  const result = await verifyTask({
+    task: "Fix code", maxRepairs: 2,
+    prompt: async text => { order.push(prompts.length ? "repair" : "write"); prompts.push(text); },
+    analyze: async () => { order.push("check"); return report("passed", scans++ === 0); },
+    reviewFinding: async (check, finding) => { order.push("review " + finding.id); return locatedReview(check, finding); },
+  });
+  assert.deepEqual(order, ["write", "check", "review project-finding", "repair", "check"]);
+  assert.equal(result.outcome, "verified");
+  assert.equal(result.repairRounds, 1);
+  assert.deepEqual(result.reviews.map(({ findingId, checkReportPath, repairTarget }) => ({ findingId, checkReportPath, repairTarget })),
+    [{ findingId: "project-finding", checkReportPath: result.checks[0].reportPath, repairTarget: true }]);
+  assert.match(prompts[1], /project-finding/);
+  assert.match(prompts[1], /src\/Example\.java/);
+  assert.match(prompts[1], /normalized value is discarded/);
+});
+
+test("a mixed report sends only located defects for repair and leaves pending evidence unresolved", async () => {
+  const first = report("findings", true);
+  const pending = { ...first.findings[0], id: "other-warning", message: "Unverified warning from another method" };
+  first.findings.push(pending);
+  first.findingCounts.project = first.findingCounts.total = 2;
+  const remaining = report("findings", true);
+  remaining.reportPath = "/test-project/after-repair/check.json";
+  remaining.findings = [pending];
+  const reports = [first, remaining];
+  const prompts: string[] = [];
+  const result = await verifyTask({
+    task: "Fix code", maxRepairs: 2, repairMode: "auto",
+    analyze: async () => reports.shift()!,
+    prompt: async text => { prompts.push(text); },
+    reviewFinding: async (check, finding) => {
+      const review = locatedReview(check, finding);
+      if (finding.id === pending.id)
+        review.suggestion = { ...review.suggestion!, assessment: "analysis_incomplete", coverage: "insufficient",
+          missingEvidence: ["Caller implementation"] };
+      return review;
+    },
+  });
+  assert.equal(result.outcome, "unresolved");
+  assert.equal(result.repairRounds, 1);
+  assert.deepEqual(result.checks, [first, remaining]);
+  assert.deepEqual(first.findings.map(finding => finding.id), ["project-finding", "other-warning"]);
+  assert.deepEqual(result.reviews.map(item => [item.checkReportPath, item.findingId, item.repairTarget]),
+    [[first.reportPath, "project-finding", true], [first.reportPath, "other-warning", false], [remaining.reportPath, "other-warning", false]]);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /project-finding/);
+  assert.doesNotMatch(prompts[1], /Unverified warning from another method/);
 });
 
 test("a failed analyzer with no findings is never accepted as verified", async () => {
@@ -220,7 +421,7 @@ test("skipping Tai-e runs the task once without analysis, check callbacks, or re
     onCheck: () => { assert.fail("Skipped verification must not report a host check"); },
   });
   assert.deepEqual(prompts, ["Write code without Tai-e this round"]);
-  assert.deepEqual(result, { schemaVersion: 2, outcome: "skipped", checks: [], baseline: { status: "skipped" }, repairRounds: 0 });
+  assert.deepEqual(result, { schemaVersion: 2, outcome: "skipped", checks: [], reviews: [], baseline: { status: "skipped" }, repairRounds: 0 });
   assert.notEqual(result.outcome, "verified");
 });
 

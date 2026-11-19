@@ -70,10 +70,10 @@ index 1741b8e..0efe1a5 100644
  }
 diff --git a/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java b/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java
 new file mode 100644
-index 0000000..e0a3938
+index 0000000..d46016f
 --- /dev/null
 +++ b/src/main/java/pascal/taie/analysis/bugfinder/DivisionByZero.java
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,389 @@
 +/*
 + * Tai-e: A Static Analysis Framework for Java
 + *
@@ -130,6 +130,7 @@ index 0000000..e0a3938
 +import pascal.taie.ir.stmt.SwitchStmt;
 +import pascal.taie.language.type.LongType;
 +import pascal.taie.language.classes.ExceptionNames;
++import pascal.taie.util.collection.Maps;
 +import pascal.taie.util.collection.Sets;
 +
 +import java.util.ArrayDeque;
@@ -162,6 +163,7 @@ index 0000000..e0a3938
 +        NodeResult<Stmt, LongFact> longs = Solver.<Stmt, LongFact>getSolver()
 +                .solve(new LongAnalysis(cfg, ints));
 +        Set<BugInstance> findings = Sets.newOrderedSet();
++        Map<BugInstance, Map<String, Object>> evidence = Maps.newMap();
 +        Set<Stmt> visited = Sets.newSet();
 +        Queue<Stmt> work = new ArrayDeque<>();
 +        work.add(cfg.getEntry());
@@ -170,21 +172,33 @@ index 0000000..e0a3938
 +            if (!visited.add(stmt)) {
 +                continue;
 +            }
-+            boolean zero = hasZeroDivisor(stmt, ints, longs);
++            Long divisorValue = constantDivisor(stmt, ints, longs);
++            boolean zero = divisorValue != null && divisorValue == 0L;
 +            if (zero) {
 +                ArithmeticExp arithmetic = (ArithmeticExp)
 +                        ((DefinitionStmt<?, ?>) stmt).getRValue();
 +                BugType type = arithmetic.getOperator() == ArithmeticExp.Op.DIV
 +                        ? BugType.INTEGER_DIVIDE_BY_ZERO
 +                        : BugType.INTEGER_REMAINDER_BY_ZERO;
-+                findings.add(new BugInstance(type, Severity.CRITICAL, ir.getMethod())
-+                        .setSourceLine(stmt.getLineNumber()));
++                BugInstance bug = new BugInstance(type, Severity.CRITICAL, ir.getMethod())
++                        .setSourceLine(stmt.getLineNumber());
++                if (findings.add(bug)) {
++                    Var divisor = arithmetic.getOperand2();
++                    evidence.put(bug, Map.of("kind", "constant-integral-divisor",
++                            "operator", arithmetic.getOperator().name(), "divisorValue", divisorValue,
++                            "divisorType", divisor.getType() instanceof LongType ? "long" : "int",
++                            "divisorVariable", divisor.getName(), "statement", stmt.toString(),
++                            "statementIndex", stmt.getIndex(), "line", stmt.getLineNumber()));
++                }
 +            }
 +            for (CFGEdge<Stmt> edge : cfg.getOutEdgesOf(stmt)) {
 +                if ((!zero || edge.isExceptional()) && isFeasible(edge, ints, longs)) {
 +                    work.add(edge.target());
 +                }
 +            }
++        }
++        if (!evidence.isEmpty()) {
++            ir.storeResult(ID + "-evidence", evidence);
 +        }
 +        return findings;
 +    }
@@ -216,24 +230,24 @@ index 0000000..e0a3938
 +        }
 +    }
 +
-+    private static boolean hasZeroDivisor(Stmt stmt,
-+                                         NodeResult<Stmt, CPFact> ints,
-+                                         NodeResult<Stmt, LongFact> longs) {
++    private static Long constantDivisor(Stmt stmt,
++                                        NodeResult<Stmt, CPFact> ints,
++                                        NodeResult<Stmt, LongFact> longs) {
 +        if (!(stmt instanceof DefinitionStmt<?, ?> definition)
 +                || !(definition.getRValue() instanceof ArithmeticExp arithmetic)
 +                || arithmetic.getOperator() != ArithmeticExp.Op.DIV
 +                && arithmetic.getOperator() != ArithmeticExp.Op.REM) {
-+            return false;
++            return null;
 +        }
 +        Var divisor = arithmetic.getOperand2();
 +        if (Exps.holdsInt(divisor)) {
 +            Value value = ints.getInFact(stmt).get(divisor);
-+            return value.isConstant() && value.getConstant() == 0;
++            return value.isConstant() ? (long) value.getConstant() : null;
 +        } else if (divisor.getType() instanceof LongType) {
 +            LongValue value = longs.getInFact(stmt).get(divisor);
-+            return value.isConstant() && value.constant == 0L;
++            return value.constant;
 +        }
-+        return false;
++        return null;
 +    }
 +
 +    private static boolean isFeasible(CFGEdge<Stmt> edge,

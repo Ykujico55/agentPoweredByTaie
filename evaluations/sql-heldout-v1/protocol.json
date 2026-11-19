@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "id": "sql-heldout-v1",
+  "frozenAt": "2026-11-03T11:44:30.445Z",
+  "promptVersion": "2",
+  "systemPromptSha256": "c2cc4b98f5ca1b1e639889f98a057444bc47e8ff8823f541234d4327dd736c6a",
+  "systemPromptFile": "evaluations/sql-heldout-v1/system-prompt.txt",
+  "frozenFiles": {
+    "src/review.ts": "c1a90d581bcac538b108726c5769dc0940257f139333a9f617b7b200f9e0cbe6",
+    "src/review-evidence.ts": "932319090eb87fde7144087383946f0ad99fe75ca8355660c69c35311c156a55",
+    "src/review-model.ts": "25c9f776f767198dca81fa1d19a74a1de315dd0fa15795de46d317e9287aaf85",
+    "scripts/review-sql-probe.ts": "fe6ad78c761bb697287d70fe119a046bdb3974a0615f2774f3fe1b13fbe69e4d"
+  },
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "timeoutMs": 180000,
+  "maxRetries": 0,
+  "maxTokens": 4096,
+  "caseIds": [
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L"
+  ],
+  "evidenceMode": "full_recorded_case_entry_and_policy",
+  "selection": "All actual project TAINT_FLOW findings from the six predeclared cases; preserve no-finding cases and all failures. No synthetic findings, no model-driven selection.",
+  "classification": {
+    "truthMapping": {
+      "vulnerable": "true_positive",
+      "safe_under_stated_assumptions": "suspected_false_positive"
+    },
+    "primary": "Correct valid binary classification / all eligible actual findings; abstentions, errors, invalid and stale responses remain in denominator.",
+    "secondary": "Correct binary / valid binary decisions, with decision coverage; report per-case counts and confusion matrix, never treat multiple findings as independent programs.",
+    "undetected": "Report separately against all six planned cases; no review accuracy score for absent findings.",
+    "rawAndNormalized": "Record both separately; rejected schemas never count as successful decisions."
+  },
+  "facts": {
+    "scope": "All concrete checkable claims in ruleClaim, rationale, assumptions and missingEvidence, including statements about supplied or missing evidence.",
+    "labels": [
+      "correct",
+      "incorrect",
+      "unsupported",
+      "unverifiable"
+    ],
+    "atomicAccuracy": "correct / all adjudicated atomic claims; incorrect, unsupported and unverifiable remain in denominator; report all counts.",
+    "responseAccuracy": "Eligible responses with at least one checkable claim and all claims correct / all planned review attempts; empty, invalid or absent explanations do not pass.",
+    "dimensions": [
+      "method_or_binding",
+      "value_or_side_effect",
+      "line_or_location",
+      "interprocedural_or_path",
+      "evidence_or_policy"
+    ],
+    "coverage": "Report fact counts and dimension coverage; silence is not evidence of competence.",
+    "adjudication": "Agent-assisted source/evidence review, provisional until human sign-off; not an automatic proof or an independent human label."
+  },
+  "constraints": [
+    "No prompt, parser, transport or budget tuning based on this set.",
+    "Freeze fixture, oracle, evidence template and rubric before API calls.",
+    "No retries, no automatic finding dismissal, no daily /review evidence integration.",
+    "Preserve classification-correct/explanation-wrong examples and all errors.",
+    "Synthetic newly authored held-out relative to prompt tuning; not a representative external benchmark."
+  ],
+  "factAnchors": {
+    "G": [
+      {
+        "id": "G.source_sink",
+        "description": "read result is stored in value and the query argument reaches the sole sink"
+      },
+      {
+        "id": "G.feasible_path",
+        "description": "at least one concrete input-derived path: negative mode directly, or positive even mode via route"
+      },
+      {
+        "id": "G.other_paths",
+        "description": "constant/safe branches do not refute the remaining feasible source-to-sink path"
+      }
+    ],
+    "H": [
+      {
+        "id": "H.assignments",
+        "description": "source-derived assignments require mode<-1 or mode>2"
+      },
+      {
+        "id": "H.sink_guard",
+        "description": "only 0<=mode<=2 reaches the sink; mode is unchanged"
+      },
+      {
+        "id": "H.all_paths",
+        "description": "the incompatible guards imply constant query on every path reaching the sink"
+      }
+    ],
+    "I": [
+      {
+        "id": "I.objects",
+        "description": "first and second are distinct fresh boxes; sink reads first.query"
+      },
+      {
+        "id": "I.loop_alias",
+        "description": "for a nonnegative mode cursor aliases first and iteration zero stores the source value"
+      },
+      {
+        "id": "I.alternative",
+        "description": "negative mode writes only second; this safe route does not remove the nonnegative witness"
+      }
+    ],
+    "J": [
+      {
+        "id": "J.slots",
+        "description": "source writes target slot 0 while slot 1 receives a literal"
+      },
+      {
+        "id": "J.both_branches",
+        "description": "both mode branches set slot 1 before the sink; assignment order does not change indices"
+      },
+      {
+        "id": "J.sink_index",
+        "description": "fresh array does not escape and the sole sink reads fixed index 1"
+      }
+    ],
+    "K": [
+      {
+        "id": "K.fallthrough",
+        "description": "case 0 falls through case 1 but mode remains 0"
+      },
+      {
+        "id": "K.feasible_path",
+        "description": "mode 1 or 2 preserves source data at the sink"
+      },
+      {
+        "id": "K.overwrite",
+        "description": "the later constant overwrite applies only to mode 0; refuting that path is insufficient"
+      }
+    ],
+    "L": [
+      {
+        "id": "L.writes",
+        "description": "try and both catches can write source data to the same draft.query field"
+      },
+      {
+        "id": "L.finally",
+        "description": "finally unconditionally replaces that field with the fixed query"
+      },
+      {
+        "id": "L.sink_order",
+        "description": "sink reads the field after finally with no intervening write, on every path reaching it"
+      }
+    ]
+  },
+  "rubricFinalizedAt": "2026-11-03T11:52:13.159Z",
+  "rubricFile": "evaluations/sql-heldout-v1/rubric.md"
+}

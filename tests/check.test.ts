@@ -56,6 +56,8 @@ test('a passing Maven check retains dependency counts without letting library fi
   const findingCheck = normalizeMavenCheck(raw);
   assert.equal(findingCheck.status, 'findings');
   assert.equal(findingCheck.backendStatus, 'passed');
+  assert.match(renderCheckResult(findingCheck), /ID: project-bug/);
+  assert.match(renderCheckResult(findingCheck), /\/review <告警ID>/);
 });
 
 test('zero findings cannot override unsuccessful backend status or failed, unrun or incomplete stages', () => {

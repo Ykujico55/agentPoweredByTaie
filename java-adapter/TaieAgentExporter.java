@@ -118,6 +118,10 @@ public final class TaieAgentExporter {
                 if (bug.getSourceLineStart() > 0) finding.put("startLine", bug.getSourceLineStart());
                 if (bug.getSourceLineEnd() > 0) finding.put("endLine", bug.getSourceLineEnd());
                 finding.put("message", bug.toString());
+                if (analysis.equals("division-by-zero")) {
+                    Map<BugInstance, ?> evidence = method.getIR().getResult("division-by-zero-evidence", Map.of());
+                    if (evidence.containsKey(bug)) finding.put("evidence", evidence.get(bug));
+                }
             } else if (analysis.equals("dead-code") && value instanceof Stmt stmt) {
                 finding.put("type", "DEAD_CODE");
                 finding.put("severity", "INFO");

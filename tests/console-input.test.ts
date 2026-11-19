@@ -118,6 +118,20 @@ test("terminal Ctrl+C cancels active work without closing the following chat pro
   } finally { consoleInput.close(); }
 });
 
+test("cancelling a repair question releases it without consuming the next chat message", { timeout: 2_000 }, async () => {
+  const { input, output } = streams();
+  const consoleInput = createConsoleInput(input, output);
+  const controller = new AbortController();
+  try {
+    const pending = consoleInput.ask("repair? ", controller.signal);
+    controller.abort();
+    assert.equal(await pending, undefined);
+    input.write("next task\n");
+    assert.equal(await consoleInput.nextTask("task> "), "next task");
+    assert.equal(await consoleInput.ask("repair? ", controller.signal), undefined);
+  } finally { consoleInput.close(); }
+});
+
 test("terminal Ctrl+C without an interrupt handler closes the input", { timeout: 2_000 }, async () => {
   const { input, output } = streams();
   Object.assign(input, { isTTY: true });
